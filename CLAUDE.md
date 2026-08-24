@@ -93,8 +93,8 @@ report finding or a demo beat. Silently "improving" them damages the deliverable
 2. **O(n) vs O(n log n) cannot be reliably separated** at these input sizes — log-log slopes of
    1.00 vs ~1.10 sit inside measurement noise. The profiler reports `confidence: low` instead of
    faking a precision it does not have. Do not add heuristics to force a confident answer here.
-3. **Method B (opcode counting) is blind to C-implemented builtins.** `sys.settrace` only sees
-   Python-level opcodes, so work inside `list.sort()`, `sum()`, or `str.join()` counts as a
+3. **Method B (opcode counting) is blind to C-implemented builtins.** Opcode counting only sees
+   Python-level bytecode, so work inside `list.sort()`, `sum()`, or `str.join()` counts as a
    single `CALL`, and a Timsort-based O(n log n) solution looks near-linear.
    **`samples/has_duplicate_onlogn.py` exists specifically to exhibit this**, and
    `experiments/confusion_matrix.py` asserts the wrong answer rather than hiding it. This is the
@@ -191,9 +191,14 @@ report. Current position is tracked in the README's **Project status** table —
 phases land.
 
 0. Repo bootstrap, README, CLAUDE.md ✅
-1. Python 3.14 capability probe — `f_trace_opcodes`, `tracemalloc.reset_peak`, no `resource` on
-   Windows, `docker` present? If settrace opcode tracing has regressed, Method B switches to
-   `sys.monitoring` (PEP 669 `INSTRUCTION` events) and nothing else changes.
+1. Python 3.14 capability probe (`cdap/capabilities.py`) ✅ — **finding:** `sys.settrace` +
+   `f_trace_opcodes` is *silently inert* on CPython 3.14.3 (counts zero opcodes), so Method B
+   uses `sys.monitoring` (PEP 669 `INSTRUCTION` events), which the probe verified counts,
+   is deterministic, and scales (ratio 1.98 on a linear workload, ~31× overhead). The probe
+   also found no `resource.setrlimit` and no Docker daemon on this box (both expected on
+   Windows, both degrade gracefully), and that the console needs `sys.stdout.reconfigure`
+   to UTF-8 for the wire log's `→ ← ✗` markers — `enable_utf8_output()` handles it, with an
+   ASCII fallback if reconfigure fails.
 2. `status.py`, `protocol.py` — framing + the wire logger
 3. `problems.py`, `judge/runner.py`, `judge/sandbox.py`, `judge/backends.py` (subprocess)
 4. `judge/profiler.py` — the model fitter

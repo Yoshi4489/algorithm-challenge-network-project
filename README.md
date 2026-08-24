@@ -72,6 +72,17 @@ transports in separate panes makes the protocol split visible rather than merely
 Requires **Python 3.9+** (3.14 tested). No third-party packages needed. `psutil` and Docker
 are optional — see [Sandbox](#sandbox).
 
+Check what your interpreter and machine can actually do before anything else:
+
+```bash
+python -m cdap.capabilities
+```
+
+That reports which opcode-counting mechanism is usable, whether auxiliary-space measurement and
+hard memory limits are available, whether a Docker daemon is reachable, and whether the console
+can render the wire log's markers. See [Method B](#method-b--opcode-counting-deterministic-exact)
+for why this check is not optional.
+
 ---
 
 ## Architecture
@@ -309,9 +320,25 @@ never process startup.
 
 ### Method B — opcode counting (deterministic, exact)
 
-`sys.settrace` with `frame.f_trace_opcodes = True`, counting executed opcodes. Deterministic,
-so one run per size suffices — but tracing is ~50–100× slower, so sizes shrink to
-`[500, 1000, 2000, 4000]`.
+Counts the bytecode instructions a solution actually executes, instead of timing it. Because
+the count is **deterministic**, one run per input size suffices — no repeats, no noise.
+
+Two mechanisms can do this, and `cdap/capabilities.py` probes both at startup rather than
+assuming either works:
+
+- **`sys.monitoring` `INSTRUCTION` events** (PEP 669, Python 3.12+) — the one actually used.
+- **`sys.settrace` + `frame.f_trace_opcodes`** — the historical approach, kept as a fallback.
+
+**Measured finding on CPython 3.14.3 (Windows 11):** `sys.settrace` opcode tracing is
+**silently inert** — it counts *zero* opcodes rather than raising. That failure mode is
+dangerous in exactly this application: zero counts at every input size fit `O(1)` perfectly,
+so Method B would have confidently reported every submission as constant-time and accepted
+every too-slow solution. The probe catches it by requiring a counter to produce counts that
+are non-zero, reproducible, **and scale with the input** before it will be used.
+`sys.monitoring` passed all three (ratio 1.98 on a linear workload, ~31× overhead), so it is
+selected. This is why the capability probe is Phase 1 and not an afterthought.
+
+Tracing overhead means Method B's input sizes shrink to `[500, 1000, 2000, 4000]`.
 
 ### Shared model fitter
 
@@ -355,9 +382,9 @@ These are documented deliberately. Two of them are findings, not defects:
 1. **O(n) vs O(n log n) cannot be reliably separated** at these input sizes — the log-log
    slopes are 1.00 vs ~1.10, well inside measurement noise. The profiler says so via
    `confidence: low` rather than pretending to a precision it does not have.
-2. **Method B is blind to C-implemented builtins.** `sys.settrace` only sees Python-level
-   opcodes, so work inside `list.sort()`, `sum()`, or `str.join()` registers as a single `CALL`.
-   A Timsort-based O(n log n) solution therefore looks near-linear under Method B.
+2. **Method B is blind to C-implemented builtins.** Opcode counting only sees Python-level
+   bytecode, so work inside `list.sort()`, `sum()`, or `str.join()` registers as a single
+   `CALL`. A Timsort-based O(n log n) solution therefore looks near-linear under Method B.
    `samples/has_duplicate_onlogn.py` exists specifically to exhibit this, and the confusion
    matrix experiment measures it.
 3. **Worst-case inputs are the problem author's responsibility.** A quicksort measures
@@ -446,8 +473,8 @@ Built in phases, each ending in a demoable result and its own commit.
 | # | Phase | Status |
 |---|---|---|
 | 0 | Repo bootstrap, README, CLAUDE.md | ✅ done |
-| 1 | Python 3.14 capability probe (`f_trace_opcodes`, `tracemalloc.reset_peak`) | ⏳ next |
-| 2 | `status.py`, `protocol.py` — framing + wire logging | ⬜ |
+| 1 | Python 3.14 capability probe (`f_trace_opcodes`, `tracemalloc.reset_peak`) | ✅ done |
+| 2 | `status.py`, `protocol.py` — framing + wire logging | ⏳ next |
 | 3 | `problems.py`, `runner.py`, `sandbox.py`, subprocess backend | ⬜ |
 | 4 | `profiler.py` — the model fitter | ⬜ |
 | 5 | `server.py` TCP path, `client.py` — a full duel | ⬜ |
