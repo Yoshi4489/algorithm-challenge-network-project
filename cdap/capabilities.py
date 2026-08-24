@@ -310,6 +310,16 @@ def _probe_console_unicode() -> tuple[bool, str]:
     return True, f"stdout encoding {encoding} renders the arrow markers"
 
 
+def console_unicode_ok() -> bool:
+    """True if stdout can render the wire log's ``→ ← ✗`` markers.
+
+    The wire logger calls this once to choose between Unicode and ASCII markers.
+    Public because it is a normal runtime question, not just a diagnostic one.
+    """
+    ok, _ = _probe_console_unicode()
+    return ok
+
+
 def _probe_docker() -> tuple[bool, str]:
     """Is the Docker CLI present *and* is a daemon actually answering?
 
@@ -371,11 +381,23 @@ class Capabilities:
 
     def opcode_counter(self):
         """Return the chosen counting function, or None if Method B is unavailable."""
-        if self.opcode_counter_name == "sys.monitoring":
-            return count_opcodes_monitoring
-        if self.opcode_counter_name == "sys.settrace":
-            return count_opcodes_settrace
-        return None
+        return opcode_counter_by_name(self.opcode_counter_name)
+
+
+def opcode_counter_by_name(name: str):
+    """Map a mechanism name to its counting function, or None for ``"none"``.
+
+    Exists so a judge child process can obtain the counter *without* re-running
+    ``probe()``. Probing costs real time — it executes workloads under both mechanisms
+    to check they count, are deterministic, and scale — and paying that per submission
+    would dominate the measurement it is supposed to protect. The parent probes once at
+    startup, decides, and passes the winning name down; the child just looks it up.
+    """
+    if name == "sys.monitoring":
+        return count_opcodes_monitoring
+    if name == "sys.settrace":
+        return count_opcodes_settrace
+    return None
 
 
 def probe() -> Capabilities:

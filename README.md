@@ -83,6 +83,18 @@ hard memory limits are available, whether a Docker daemon is reachable, and whet
 can render the wire log's markers. See [Method B](#method-b--opcode-counting-deterministic-exact)
 for why this check is not optional.
 
+Then check the wire layer itself, which starts no servers and needs no ports:
+
+```bash
+python -m cdap.selftest_protocol
+```
+
+It builds a request, a response, and an event; prints them through the real wire logger;
+re-parses each one; verifies a `Body-SHA256` and then breaks it; proves a `606` cannot be used as
+a response status; round-trips a UDP datagram through the percent-encoding codec and drops a
+stale `seq`; and finally writes **two frames in a single `sendall()`** over a loopback socket to
+show the reader finding the boundary in a byte stream that has none of its own.
+
 ---
 
 ## Architecture
@@ -474,8 +486,8 @@ Built in phases, each ending in a demoable result and its own commit.
 |---|---|---|
 | 0 | Repo bootstrap, README, CLAUDE.md | ✅ done |
 | 1 | Python 3.14 capability probe (`f_trace_opcodes`, `tracemalloc.reset_peak`) | ✅ done |
-| 2 | `status.py`, `protocol.py` — framing + wire logging | ⏳ next |
-| 3 | `problems.py`, `runner.py`, `sandbox.py`, subprocess backend | ⬜ |
+| 2 | `status.py`, `protocol.py` — framing + wire logging | ✅ done |
+| 3 | `problems.py`, `runner.py`, `sandbox.py`, subprocess backend | ⏳ next |
 | 4 | `profiler.py` — the model fitter | ⬜ |
 | 5 | `server.py` TCP path, `client.py` — a full duel | ⬜ |
 | 6 | `worker.py` + dispatcher — the judge pool | ⬜ |
@@ -483,8 +495,12 @@ Built in phases, each ending in a demoable result and its own commit.
 | 8 | `DockerBackend` | ⬜ |
 | 9 | Both experiments, three bilingual docs | ⬜ |
 
-**Nothing beyond Phase 0 runs yet** — the sections above describe the design that the
-following phases implement. This table is the honest source of truth for what works.
+**What runs today:** the capability probe (`python -m cdap.capabilities`) and the wire layer
+self-test (`python -m cdap.selftest_protocol`), which frames all three message kinds, verifies
+`Body-SHA256`, refuses to mix the two status namespaces, round-trips the UDP codec, and carries
+two back-to-back frames over a real loopback socket. Everything past Phase 2 is still design
+only — the sections above describe what the following phases implement, and this table is the
+honest source of truth for what works.
 
 ---
 

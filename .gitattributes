@@ -1,0 +1,10 @@
+# Keep line endings deterministic across the graders' machines and this Windows
+# dev box. Text files are normalized to LF in the repository; Git may check them
+# out as CRLF locally, which is fine and is what the earlier warnings were about.
+* text=auto eol=lf
+
+# Anything binary we add later must never be touched.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.ico binary
