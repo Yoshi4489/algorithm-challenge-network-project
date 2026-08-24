@@ -1,0 +1,17 @@
+# CDAP runs on the Python standard library only.
+# Python 3.9+ (developed and tested on 3.14). Nothing below is required.
+#
+# Deliberate: no numpy. The complexity regression in cdap/judge/profiler.py is
+# hand-written so the math stays visible in the source and can be explained aloud
+# on video. See CLAUDE.md -> Hard constraints.
+#
+# Optional extras, both degrade gracefully when absent:
+#
+#   psutil>=5.9    parent-side memory polling for the subprocess backend on
+#                  Windows, where resource.setrlimit does not exist. Without it,
+#                  the in-child tracemalloc threshold is the only memory guard.
+#
+#   docker         not a Python package - the Docker CLI / Docker Desktop, used by
+#                  --backend docker for real cgroup limits and --network none.
+#                  If unavailable the judge falls back to subprocess and reports
+#                  that in the verdict's "backend" field.
