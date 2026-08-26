@@ -524,8 +524,8 @@ Built in phases, each ending in a demoable result and its own commit.
 | 2 | `status.py`, `protocol.py` — framing + wire logging | ✅ done |
 | 3 | `problems.py`, `runner.py`, `sandbox.py`, subprocess backend | ✅ done |
 | 4 | `profiler.py` — the model fitter | ✅ done |
-| 5 | `server.py` TCP path, `client.py` — a full duel | ⏳ next |
-| 6 | `worker.py` + dispatcher — the judge pool | ⬜ |
+| 5 | `server.py` TCP path, `client.py` — a full duel | ✅ done |
+| 6 | `worker.py` + dispatcher — the judge pool | ⏳ next |
 | 7 | UDP feed, stale-drop, `--feed-only`, `--no-udp` | ⬜ |
 | 8 | `DockerBackend` | ⬜ |
 | 9 | Both experiments, three bilingual docs | ⬜ |
@@ -533,7 +533,8 @@ Built in phases, each ending in a demoable result and its own commit.
 **What runs today:** the capability probe (`python -m cdap.capabilities`), the wire layer
 self-test (`python -m cdap.selftest_protocol`), which frames all three message kinds, verifies
 `Body-SHA256`, refuses to mix the two status namespaces, round-trips the UDP codec, and carries
-two back-to-back frames over a real loopback socket — and, as of Phase 4, the judge itself:
+two back-to-back frames over a real loopback socket; the judge itself; and, as of Phase 5, a
+complete two-player duel over real TCP sockets:
 
 ```bash
 python -m cdap.problems                                     # problem catalogue self-check
@@ -541,6 +542,9 @@ python -m cdap.judge.sandbox samples/evil_socket.py          # AST guard verdict
 python -m cdap.judge.backends samples/max_subarray_on2.py    # run + measure one submission
 python -m cdap.judge.profiler samples/max_subarray_on2.py    # measure + judge -> 606
 python -m cdap.judge.profiler samples/fib_naive.py fib       # naive recursion -> 606
+python -m cdap.server --tcp-port 5050 --countdown 1           # terminal 1
+python -m cdap.client --user alice --queue --submit samples/max_subarray_on.py --once
+python -m cdap.client --user bob --queue --submit samples/max_subarray_on2.py --once
 ```
 
 `cdap.judge.backends` is the end-to-end judge minus the decision: it runs a submission in a
@@ -559,7 +563,7 @@ are now measured *and* judged.
 `forge_result.py`, which prints a fake `__CDAP_RESULT__` line and is ignored because the real
 one is always last, and `has_duplicate_onlogn.py`, which exists to *fail* Method B.
 
-Everything past Phase 4 is still design only — the sections above describe what the following
+Everything past Phase 5 is still design only — the sections above describe what the following
 phases implement, and this table is the honest source of truth for what works.
 
 ---

@@ -54,7 +54,7 @@ from enum import Enum
 from urllib.parse import quote, unquote
 
 from . import capabilities
-from .status import assert_protocol_status, format_status, phrase_for
+from .status import assert_protocol_status, describe_status, format_status, phrase_for
 
 PROTOCOL_NAME = "CDAP"
 PROTOCOL_VERSION = "CDAP/1.0"
@@ -283,11 +283,18 @@ class Message:
 
     @property
     def name(self) -> str:
-        """Short label for logs and dispatch tables."""
+        """Short label for logs and dispatch tables.
+
+        ``describe_status`` rather than ``format_status``, because this property is used to
+        render frames that *arrived*. A received response carries whatever status and phrase
+        the peer chose, and the strict formatter would raise on a code outside our table —
+        inside the log line whose whole job is to report that. Frames we build are validated
+        by the constructors, so nothing is lost by being tolerant here.
+        """
         if self.kind is Kind.REQUEST:
             return self.method
         if self.kind is Kind.RESPONSE:
-            return format_status(self.status, self.phrase)
+            return describe_status(self.status, self.phrase)
         return f"{EVENT_TOKEN} {self.event}"
 
     def body_sha256(self) -> str:
@@ -495,14 +502,19 @@ class Connection:
     def close(self):
         """Close the connection, tolerating a peer that has already gone away."""
         self.closed = True
-        try:
-            self._reader.close()
-        except OSError:
-            pass
+        # Wake a thread blocked inside ``readline`` before closing the buffered reader.
+        # On Windows, closing the file object first waits for that reader's internal lock;
+        # if another thread owns it while blocked on the socket, cleanup stalls until the
+        # peer sends something. ``shutdown`` makes the read return immediately, after which
+        # the file object can be closed without that circular wait.
         try:
             self._sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass  # already closed, or never connected
+        try:
+            self._reader.close()
+        except (OSError, ValueError):
+            pass
         try:
             self._sock.close()
         except OSError:

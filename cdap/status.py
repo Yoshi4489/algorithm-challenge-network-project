@@ -150,6 +150,13 @@ class Verdict(IntEnum):
     SPACE_COMPLEXITY_VIOLATION = 607
     OUTPUT_FORMAT_ERROR = 608
     SANDBOX_VIOLATION = 609
+
+    # 610 is unassigned, and the gap is kept rather than closed. 600-609 are verdicts about
+    # the *submission*: it was wrong, too slow, over a limit, hostile. 611 and 612 are
+    # verdicts about the *judgment* — the judge could not reach a confident answer, or the
+    # judge itself broke. Those two are the only verdicts that are not a statement about the
+    # player's code, so they start on a fresh number. Renumbering them down to close the gap
+    # would also be fine; leaving it documented costs nothing and the boundary is real.
     INDETERMINATE_COMPLEXITY = 611     # measurements fit no model well enough to judge
     JUDGE_ERROR = 612                  # the judge itself failed; never the player's fault
 
@@ -245,8 +252,44 @@ def format_status(code, phrase=None) -> str:
     Handles both namespaces, because every log line and every start line needs the
     code and the phrase together. The assignment asks for both; there is no code
     path in CDAP that prints a bare number.
+
+    Strict: an unknown code or an undeclared phrase raises. That is right for
+    everything *we* build, and wrong for anything we *received* — see
+    ``describe_status``.
     """
     value = int(code)
     if 600 <= value < 700:
         return f"{value} {verdict_phrase_for(value)}"
     return f"{value} {phrase_for(value, phrase)}"
+
+
+def describe_status(code, phrase=None) -> str:
+    """Render a code and phrase that arrived from a peer, **never raising**.
+
+    ``format_status`` is deliberately strict, and that strictness is a feature right up
+    to the moment the value came from someone else. ``parse_start_line`` records a
+    response's status and phrase exactly as sent, without validating either — it has to,
+    because refusing to parse a frame we disagree with would leave us unable to answer
+    ``426`` or ``400`` and explain why.
+
+    So there is a gap: a peer can send ``CDAP/1.0 999 NONSENSE``, and the *log line* that
+    would have told us so would itself raise while formatting it. One malformed frame
+    would take down the session that was about to reject it, turning a peer's mistake into
+    our own failure.
+
+    This closes that gap. Strict when we build a frame, tolerant when we display one —
+    and the code and phrase still always travel together, which is the requirement that
+    matters.
+    """
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return f"? {phrase or 'UNKNOWN'}"
+    if phrase:
+        # Shown exactly as received. A phrase we do not recognise is information about the
+        # peer, and rewriting it to our own spelling would hide that.
+        return f"{value} {phrase}"
+    try:
+        return format_status(value)
+    except (ValueError, KeyError):
+        return f"{value} UNKNOWN"
