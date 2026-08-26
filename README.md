@@ -157,10 +157,18 @@ Common headers: `Seq`, `Session`, `Match`, `Submission`, `Content-Length`, `Cont
 
 | Method | Body | Success | Errors |
 |---|---|---|---|
-| `HELLO` | – | `200 OK` + `Server` | `426 VERSION_UNSUPPORTED` |
+| `HELLO` | – | `200 OK` + `Server`, `Session` | `426 VERSION_UNSUPPORTED` |
 | `REGISTER` | `{user,pass}` | `201 REGISTERED` | `409 USER_EXISTS`, `400 BAD_REQUEST` |
-| `LOGIN` | `{user,pass}` | `200 OK` + `Session` | `401 AUTH_FAILED` |
-| `LOGOUT` | – | `200 OK` | `401 AUTH_FAILED` |
+| `LOGIN` | `{user,pass}` | `200 OK` + `Session`, `Token` | `401 AUTH_FAILED` |
+| `LOGOUT` | – | `204 NO_CONTENT` | `401 AUTH_FAILED` |
+
+`HELLO`'s body advertises what the arena can do — protocol version, problem list, match
+clock, and a `judge` block naming the backend and the opcode counter actually in use — so a
+client discovers the arena instead of hard-coding it.
+
+`LOGIN` answers **the same `401 AUTH_FAILED`** for an unknown user and for a wrong password.
+Distinguishing them would turn `LOGIN` into a username oracle, and the arena has no reason to
+confirm who has an account.
 
 **Lobby / matchmaking**
 
@@ -168,13 +176,23 @@ Common headers: `Seq`, `Session`, `Match`, `Submission`, `Content-Length`, `Cont
 |---|---|---|
 | `QUEUE {mode,difficulty}` | `202 QUEUED` + `Queue-Pos`, `Est-Wait-Ms` | `409 ALREADY_QUEUED` |
 | `DEQUEUE` | `200 OK` | `409 NOT_QUEUED` |
-| `CREATE_ROOM {config}` | `201 CREATED` + `Room` | `429 RATE_LIMITED` |
-| `JOIN_ROOM {code}` | `200 OK` | `404 ROOM_NOT_FOUND`, `409 ROOM_FULL` |
+| `CREATE_ROOM {problem}` | `201 CREATED` + `Room`, `Capacity` | `404 NOT_FOUND`, `429 RATE_LIMITED` |
+| `JOIN_ROOM {room}` | `200 OK` + `Room` | `404 ROOM_NOT_FOUND`, `409 ROOM_FULL` |
 | `READY` | `200 OK` | `403 NOT_IN_ROOM` |
-| `LEAVE` / `FORFEIT` | `200 OK` | – |
+| `LEAVE` | `204 NO_CONTENT` | `403 NOT_IN_ROOM` |
+| `FORFEIT` | `200 OK` | `403 NOT_IN_MATCH` |
 
-**Problem** — `GET_PROBLEM` → `200 OK` + problem JSON. Errors: `403 NOT_IN_MATCH`,
-`410 MATCH_ENDED`. The body carries the complexity contract:
+The state table earns its keep here. `QUEUE` and `DEQUEUE` are both *accepted* in the
+`QUEUED` state rather than rejected by the state check, because otherwise queueing twice
+would collapse into a generic `403 WRONG_STATE` and the specific `409 ALREADY_QUEUED` /
+`409 NOT_QUEUED` codes would be unreachable. A status code no request can produce is a status
+code that does not exist.
+
+**Problem** — `GET_PROBLEM` → `200 OK` + problem JSON. Errors: `403 NOT_IN_MATCH` (never been
+in one), `403 WRONG_STATE` (the countdown is still running — the statement is revealed when the
+clock starts, so neither player reads it early). After a match ends the problem is still
+served, on purpose: a player reviewing what they just lost to is not cheating.
+The body carries the complexity contract:
 
 ```json
 {
@@ -195,16 +213,33 @@ Common headers: `Seq`, `Session`, `Match`, `Submission`, `Content-Length`, `Cont
 
 **Submission** — `SUBMIT` with headers `Match`, `Lang`, `Content-Length`, `Body-SHA256` and the
 raw source as the body → `202 ACCEPTED` + `Submission`, `Queue-Pos`. Errors: `403 NOT_IN_MATCH`,
-`410 MATCH_ENDED`, `413 PAYLOAD_TOO_LARGE`, `415 UNSUPPORTED_LANGUAGE`,
+`403 WRONG_STATE`, `410 MATCH_ENDED`, `413 PAYLOAD_TOO_LARGE`, `415 UNSUPPORTED_LANGUAGE`,
 `422 BODY_HASH_MISMATCH`, `429 SUBMIT_COOLDOWN`, `503 JUDGE_UNAVAILABLE`.
-Also `GET_SUBMISSION` → `200 OK` + verdict JSON, or `404 NOT_FOUND`.
+Also `GET_SUBMISSION {submission}` → `200 OK` + verdict JSON when the judge is done,
+`202 ACCEPTED` + `Stage` while it is still running, `404 SUBMISSION_NOT_FOUND`, or
+`403 FORBIDDEN` for someone else's submission — **403, not 404**, because pretending another
+player's submission does not exist would be a lie the client could detect by ID collision.
+
+Two details in `SUBMIT` that the checks' *order* decides:
+
+- `415 UNSUPPORTED_LANGUAGE` is answered **before** the match checks, so `--lang rust` reaches
+  it without needing an opponent — the arena can refuse a language it cannot run whatever the
+  match state is.
+- On `503 JUDGE_UNAVAILABLE` the submission is **not recorded**, so the submit cooldown never
+  starts. Being rate-limited for a request the arena itself could not process would punish the
+  player for the arena's problem.
+
+**Debug** — `DEBUG_PANIC` → `500 INTERNAL_ERROR`, and `405 METHOD_NOT_ALLOWED` unless the
+server was started with `--allow-panic`. It exists so that `500` is a code the demo can
+actually *show* rather than merely list: the handler raises, and the dispatcher's catch-all
+turns the exception into a response instead of dropping the connection.
 
 **Worker methods** (arena ↔ judge pool): `WORKER_REGISTER`, `WORKER_PULL` (long-poll → `200 OK`
 + job, or `204 NO_CONTENT`), `WORKER_RESULT`, `WORKER_HEARTBEAT`.
 
-**Server → client events (TCP push):** `MATCH_FOUND`, `MATCH_START`, `OPPONENT_SUBMITTED`,
-`JUDGE_PROGRESS` (stages `QUEUED → COMPILING → TESTING → PROFILING → DONE`), `VERDICT`,
-`MATCH_END`, `SERVER_SHUTDOWN`.
+**Server → client events (TCP push):** `MATCH_FOUND`, `MATCH_START`, `ROOM_UPDATE`,
+`OPPONENT_SUBMITTED`, `JUDGE_PROGRESS` (stages `QUEUED → COMPILING → TESTING → PROFILING →
+DONE`), `VERDICT`, `MATCH_END`, `SERVER_SHUTDOWN`.
 
 ### Two status namespaces — a deliberate design decision
 
@@ -487,20 +522,43 @@ Built in phases, each ending in a demoable result and its own commit.
 | 0 | Repo bootstrap, README, CLAUDE.md | ✅ done |
 | 1 | Python 3.14 capability probe (`f_trace_opcodes`, `tracemalloc.reset_peak`) | ✅ done |
 | 2 | `status.py`, `protocol.py` — framing + wire logging | ✅ done |
-| 3 | `problems.py`, `runner.py`, `sandbox.py`, subprocess backend | ⏳ next |
-| 4 | `profiler.py` — the model fitter | ⬜ |
+| 3 | `problems.py`, `runner.py`, `sandbox.py`, subprocess backend | ✅ done |
+| 4 | `profiler.py` — the model fitter | ⏳ next |
 | 5 | `server.py` TCP path, `client.py` — a full duel | ⬜ |
 | 6 | `worker.py` + dispatcher — the judge pool | ⬜ |
 | 7 | UDP feed, stale-drop, `--feed-only`, `--no-udp` | ⬜ |
 | 8 | `DockerBackend` | ⬜ |
 | 9 | Both experiments, three bilingual docs | ⬜ |
 
-**What runs today:** the capability probe (`python -m cdap.capabilities`) and the wire layer
+**What runs today:** the capability probe (`python -m cdap.capabilities`), the wire layer
 self-test (`python -m cdap.selftest_protocol`), which frames all three message kinds, verifies
 `Body-SHA256`, refuses to mix the two status namespaces, round-trips the UDP codec, and carries
-two back-to-back frames over a real loopback socket. Everything past Phase 2 is still design
-only — the sections above describe what the following phases implement, and this table is the
-honest source of truth for what works.
+two back-to-back frames over a real loopback socket — and, as of Phase 3, the judge itself:
+
+```bash
+python -m cdap.problems                                     # problem catalogue self-check
+python -m cdap.judge.sandbox samples/evil_socket.py          # AST guard verdict for one file
+python -m cdap.judge.backends samples/max_subarray_on2.py    # run + measure one submission
+python -m cdap.judge.backends samples/fib_naive.py fib       # ...against a chosen problem
+```
+
+`cdap.judge.backends` is the end-to-end judge minus the decision: it runs a submission in a
+child process behind the guard, the wall-clock kill, the output cap and the sentinel result
+channel, then prints the raw measurement record — tests passed, per-size timings, opcode
+counts, peak auxiliary memory. Turning that record into a `6xx` verdict is Phase 4's job, so
+the classes named in `samples/` are measured but not yet judged.
+
+`samples/` covers the verdict matrix, each file's docstring naming its expected verdict:
+`600` `max_subarray_on.py` · `601` `max_subarray_wrong.py` · `602` `max_subarray_busy_loop.py` ·
+`603` `max_subarray_memory.py` · `604` `max_subarray_syntax_error.py` ·
+`605` `max_subarray_runtime_error.py` · `606` `max_subarray_on2.py`, `fib_naive.py` ·
+`607` `max_subarray_on_space.py` · `608` `has_duplicate_int_return.py` ·
+`609` `evil_socket.py`, `evil_open.py`, `evil_fork.py` · `611` `fib_logn.py`. Plus
+`forge_result.py`, which prints a fake `__CDAP_RESULT__` line and is ignored because the real
+one is always last, and `has_duplicate_onlogn.py`, which exists to *fail* Method B.
+
+Everything past Phase 3 is still design only — the sections above describe what the following
+phases implement, and this table is the honest source of truth for what works.
 
 ---
 

@@ -380,6 +380,7 @@ def main() -> int:
     """
     from .. import capabilities
     from ..problems import get_problem, problem_ids
+    from . import runner
 
     capabilities.enable_utf8_output()
     if not 2 <= len(sys.argv) <= 3:
@@ -403,7 +404,9 @@ def main() -> int:
     }
 
     backend = SubprocessBackend()
-    run = backend.run(job, time_limit_ms=problem.contract.time_limit_ms)
+    # See runner.run_budget_ms: a profiling run needs a wall-clock budget of its own,
+    # because the ladder calls the solution at sizes well past the correctness tests.
+    run = backend.run(job, time_limit_ms=runner.run_budget_ms(problem.contract.time_limit_ms))
 
     print(f"[backend={run.backend}] ok={run.ok} wall={run.wall_ms:.0f}ms "
           f"timed_out={run.timed_out} exit={run.exit_code}")
