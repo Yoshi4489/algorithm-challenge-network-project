@@ -523,8 +523,8 @@ Built in phases, each ending in a demoable result and its own commit.
 | 1 | Python 3.14 capability probe (`f_trace_opcodes`, `tracemalloc.reset_peak`) | ✅ done |
 | 2 | `status.py`, `protocol.py` — framing + wire logging | ✅ done |
 | 3 | `problems.py`, `runner.py`, `sandbox.py`, subprocess backend | ✅ done |
-| 4 | `profiler.py` — the model fitter | ⏳ next |
-| 5 | `server.py` TCP path, `client.py` — a full duel | ⬜ |
+| 4 | `profiler.py` — the model fitter | ✅ done |
+| 5 | `server.py` TCP path, `client.py` — a full duel | ⏳ next |
 | 6 | `worker.py` + dispatcher — the judge pool | ⬜ |
 | 7 | UDP feed, stale-drop, `--feed-only`, `--no-udp` | ⬜ |
 | 8 | `DockerBackend` | ⬜ |
@@ -533,20 +533,22 @@ Built in phases, each ending in a demoable result and its own commit.
 **What runs today:** the capability probe (`python -m cdap.capabilities`), the wire layer
 self-test (`python -m cdap.selftest_protocol`), which frames all three message kinds, verifies
 `Body-SHA256`, refuses to mix the two status namespaces, round-trips the UDP codec, and carries
-two back-to-back frames over a real loopback socket — and, as of Phase 3, the judge itself:
+two back-to-back frames over a real loopback socket — and, as of Phase 4, the judge itself:
 
 ```bash
 python -m cdap.problems                                     # problem catalogue self-check
 python -m cdap.judge.sandbox samples/evil_socket.py          # AST guard verdict for one file
 python -m cdap.judge.backends samples/max_subarray_on2.py    # run + measure one submission
-python -m cdap.judge.backends samples/fib_naive.py fib       # ...against a chosen problem
+python -m cdap.judge.profiler samples/max_subarray_on2.py    # measure + judge -> 606
+python -m cdap.judge.profiler samples/fib_naive.py fib       # naive recursion -> 606
 ```
 
 `cdap.judge.backends` is the end-to-end judge minus the decision: it runs a submission in a
 child process behind the guard, the wall-clock kill, the output cap and the sentinel result
 channel, then prints the raw measurement record — tests passed, per-size timings, opcode
-counts, peak auxiliary memory. Turning that record into a `6xx` verdict is Phase 4's job, so
-the classes named in `samples/` are measured but not yet judged.
+counts, peak auxiliary memory. `cdap.judge.profiler` is the decision: it fits that record
+against the model ladder and turns it into a `6xx` verdict, so the classes named in `samples/`
+are now measured *and* judged.
 
 `samples/` covers the verdict matrix, each file's docstring naming its expected verdict:
 `600` `max_subarray_on.py` · `601` `max_subarray_wrong.py` · `602` `max_subarray_busy_loop.py` ·
@@ -557,7 +559,7 @@ the classes named in `samples/` are measured but not yet judged.
 `forge_result.py`, which prints a fake `__CDAP_RESULT__` line and is ignored because the real
 one is always last, and `has_duplicate_onlogn.py`, which exists to *fail* Method B.
 
-Everything past Phase 3 is still design only — the sections above describe what the following
+Everything past Phase 4 is still design only — the sections above describe what the following
 phases implement, and this table is the honest source of truth for what works.
 
 ---
