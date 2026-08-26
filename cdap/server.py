@@ -47,14 +47,12 @@ lock rather than several fine ones: at this scale it costs nothing measurable, a
 means the invariants can be stated in one sentence — *nobody reads or writes arena state
 without holding it* — instead of requiring a lock-ordering argument.
 
-Where the judging happens in this phase
----------------------------------------
-Phase 5 runs judges as threads inside this process (``LocalJudgePool``), because a full
-duel with real verdicts is the phase's deliverable and an in-process pool is the shortest
-path to one. Phase 6 adds the ``WORKER_*`` methods so separate worker processes can pull
-from the same ``JobQueue`` over their own TCP connections. The queue is the seam, and it
-is already the only thing the pool touches, so Phase 6 adds a consumer rather than
-rewriting a design.
+Where the judging happens
+-------------------------
+Small demos may use ``LocalJudgePool`` threads inside the arena. Separate judge processes
+use the four ``WORKER_*`` methods to pull from that exact same ``JobQueue`` over TCP. The
+queue is the seam: local and remote consumers can coexist without either knowing about the
+other, while ``--judges 0`` makes the isolation boundary visible by requiring remote workers.
 """
 
 from __future__ import annotations
@@ -140,6 +138,13 @@ SERVER_NAME = "cdap-arena/1.0"
 #: with the list of what *is* accepted instead of a bare refusal. The client's
 #: ``--lang rust`` flag exists to trigger it on camera.
 SUPPORTED_LANGUAGES = ("python",)
+
+# Remote-worker liveness. A lease is renewed by every heartbeat and expires after three
+# missed intervals, matching the protocol brief. Kept configurable from the server CLI so
+# the ejection path can be demonstrated in seconds without changing production defaults.
+DEFAULT_WORKER_HEARTBEAT_MS = 5_000
+MISSED_HEARTBEATS_BEFORE_EJECTION = 3
+MAX_WORKER_POLL_MS = 25_000
 
 
 # --------------------------------------------------------------------------
@@ -243,6 +248,10 @@ class Session:
         self.state = State.INIT
         self.user: Optional[str] = None
         self.token: Optional[str] = None
+        # A connection becomes either a player session (after LOGIN) or a worker session
+        # (after WORKER_REGISTER), never both. Worker identity lives on the connection so a
+        # later request cannot impersonate a different registered worker with one header.
+        self.worker_id: Optional[str] = None
 
         self.match_id: Optional[str] = None
         # Kept after the match ends, and that is the whole point of having it. Without a
@@ -275,7 +284,7 @@ class Session:
     @property
     def label(self) -> str:
         """Short name for log lines: the username once known, the session id before that."""
-        return self.user or self.id
+        return self.user or self.worker_id or self.id
 
     # -- events ------------------------------------------------------------
 
@@ -396,6 +405,19 @@ class Job:
     payload: dict                           # exactly what cdap.judge.runner reads on stdin
 
 
+@dataclass
+class WorkerRecord:
+    """One registered remote judge and, while busy, the lease it owns."""
+
+    worker_id: str
+    session_id: str
+    backend: str
+    registered_at: float
+    last_seen: float
+    active_job: Optional[Job] = None
+    lease_deadline: float = 0.0
+
+
 class JobQueue:
     """Pending submissions, oldest first.
 
@@ -403,9 +425,9 @@ class JobQueue:
     ``SUBMIT`` reports a ``Queue-Pos`` header and the player deserves to know they are
     third in line.
 
-    This is the seam Phase 6 uses: ``WORKER_PULL`` will long-poll ``get`` from a separate
-    worker connection, exactly as ``LocalJudgePool`` does now. Neither consumer knows the
-    other exists.
+    This is the seam both consumers use: ``WORKER_PULL`` long-polls ``get`` from a remote
+    worker connection, exactly as ``LocalJudgePool`` does locally. Neither consumer knows
+    the other exists.
     """
 
     def __init__(self):
@@ -569,7 +591,9 @@ class Arena:
 
     def __init__(self, log: WireLog, *, min_players: int, match_seconds: float,
                  countdown: float, submit_cooldown: float, room_cooldown: float,
-                 problem_id: Optional[str], room_capacity: int, allow_panic: bool):
+                 problem_id: Optional[str], room_capacity: int, allow_panic: bool,
+                 worker_token: str = "",
+                 worker_heartbeat_ms: int = DEFAULT_WORKER_HEARTBEAT_MS):
         self.log = log
         self.min_players = min_players
         self.match_seconds = match_seconds
@@ -579,6 +603,8 @@ class Arena:
         self.pinned_problem = problem_id
         self.room_capacity = room_capacity
         self.allow_panic = allow_panic
+        self.worker_token = worker_token
+        self.worker_heartbeat_ms = max(250, int(worker_heartbeat_ms))
 
         self._lock = threading.RLock()
 
@@ -588,6 +614,7 @@ class Arena:
         self.rooms: Dict[str, Room] = {}
         self.matches: Dict[str, Match] = {}
         self.submissions: Dict[str, Submission] = {}
+        self.workers: Dict[str, WorkerRecord] = {}
 
         self.jobs = JobQueue()
         self.pool: Optional[LocalJudgePool] = None
@@ -653,6 +680,13 @@ class Arena:
         A player who pulls the plug mid-match forfeits. Any other treatment would make
         disconnecting the optimal move whenever you are losing.
         """
+        if session.worker_id is not None:
+            self.unregister_worker(session, reason="connection closed")
+            with self._lock:
+                self.sessions.pop(session.id, None)
+                session.state = State.CLOSED
+            return
+
         with self._lock:
             self.sessions.pop(session.id, None)
             if session.id in self.lobby:
@@ -989,8 +1023,13 @@ class Arena:
         session.push_event("JUDGE_PROGRESS", headers=headers)
 
     def record_verdict(self, submission_id: str, verdict: dict, backend_name: str,
-                       worker_id: str = "", wall_ms: float = 0.0) -> None:
-        """Attach a verdict to a submission, push the VERDICT event, maybe end the match."""
+                       worker_id: str = "", wall_ms: float = 0.0) -> bool:
+        """Attach the first verdict and publish it. False means a result already won.
+
+        Remote dispatch is at-least-once when a lease expires, so two workers can finish the
+        same submission. This check is the at-most-once half: the first result becomes
+        authoritative and every later result is discarded instead of rewriting history.
+        """
         # The backend that *actually ran* is stamped here, from the RunResult, never from
         # what the operator asked for. Design invariant 6: a run that fell back to
         # subprocess must not claim docker, because the security experiment's conclusions
@@ -1005,7 +1044,9 @@ class Arena:
         with self._lock:
             submission = self.submissions.get(submission_id)
             if submission is None:
-                return
+                return False
+            if submission.verdict is not None:
+                return False
             submission.verdict = verdict
             submission.stage = "DONE"
             session = self.sessions.get(submission.session_id)
@@ -1038,6 +1079,163 @@ class Arena:
         # 606 for a correct-but-too-slow solution — leaves the clock running.
         if match is not None and code == int(Verdict.ACCEPTED):
             self.end_match(match, reason="SOLVED", winner=submission.user)
+        return True
+
+    # -- remote judge workers --------------------------------------------
+
+    def judge_healthy(self) -> bool:
+        """Whether either a local judge or a registered remote worker can drain jobs."""
+        local = bool(self.pool and self.pool.healthy)
+        with self._lock:
+            remote = bool(self.workers)
+        return local or remote
+
+    def remote_worker_count(self) -> int:
+        with self._lock:
+            return len(self.workers)
+
+    def register_worker(self, session: Session, worker_id: str, backend: str) -> Tuple[bool, str]:
+        """Bind a worker id to this TCP session; duplicate live ids are rejected."""
+        now = time.monotonic()
+        with self._lock:
+            if session.authenticated:
+                return False, "a player session cannot become a judge worker"
+            existing = self.workers.get(worker_id)
+            if existing is not None and existing.session_id != session.id:
+                return False, f"worker id {worker_id!r} is already connected"
+            session.worker_id = worker_id
+            self.workers[worker_id] = WorkerRecord(
+                worker_id=worker_id,
+                session_id=session.id,
+                backend=backend,
+                registered_at=now,
+                last_seen=now,
+            )
+        self.log.note(f"worker {worker_id} registered (backend={backend})")
+        return True, ""
+
+    def unregister_worker(self, session: Session, reason: str) -> None:
+        """Eject a worker and requeue its leased job, if that job still needs a verdict."""
+        job = None
+        worker_id = session.worker_id
+        if worker_id is None:
+            return
+        with self._lock:
+            record = self.workers.get(worker_id)
+            if record is None or record.session_id != session.id:
+                return
+            self.workers.pop(worker_id, None)
+            if record.active_job is not None:
+                submission = self.submissions.get(record.active_job.submission_id)
+                if submission is not None and not submission.done:
+                    job = record.active_job
+        if job is not None:
+            position = self.jobs.put(job)
+            self.set_stage(job.submission_id, "QUEUED")
+            self.log.note(f"worker {worker_id} {reason}; requeued {job.submission_id} "
+                          f"at position {position}")
+        else:
+            self.log.note(f"worker {worker_id} {reason}")
+
+    def pull_worker_job(self, session: Session, wait_ms: int) -> Optional[Job]:
+        """Long-poll the shared queue and lease one job to a registered worker."""
+        worker_id = session.worker_id or ""
+        with self._lock:
+            record = self.workers.get(worker_id)
+            if record is None or record.session_id != session.id:
+                raise BadRequest("this connection is not a registered worker")
+            if record.active_job is not None:
+                raise BadRequest(f"worker {worker_id!r} already holds a job")
+
+        deadline = time.monotonic() + max(0, wait_ms) / 1000.0
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            job = self.jobs.get(timeout=remaining)
+            if job is None:
+                with self._lock:
+                    current = self.workers.get(worker_id)
+                    if current is not None:
+                        current.last_seen = time.monotonic()
+                return None
+
+            with self._lock:
+                current = self.workers.get(worker_id)
+                submission = self.submissions.get(job.submission_id)
+                if current is None or current.session_id != session.id:
+                    should_requeue = submission is not None and not submission.done
+                elif submission is None or submission.done:
+                    should_requeue = False
+                else:
+                    now = time.monotonic()
+                    current.active_job = job
+                    current.last_seen = now
+                    current.lease_deadline = now + self.worker_lease_ms / 1000.0
+                    return job
+            if should_requeue:
+                self.jobs.put(job)
+            if time.monotonic() >= deadline:
+                return None
+
+    @property
+    def worker_lease_ms(self) -> int:
+        return self.worker_heartbeat_ms * MISSED_HEARTBEATS_BEFORE_EJECTION
+
+    def renew_worker_lease(self, session: Session, submission_id: str,
+                           stage: str = "") -> Tuple[bool, str]:
+        """Renew the named worker's current lease and optionally publish a real stage."""
+        worker_id = session.worker_id or ""
+        now = time.monotonic()
+        with self._lock:
+            record = self.workers.get(worker_id)
+            if record is None or record.session_id != session.id:
+                return False, "worker is no longer registered"
+            job = record.active_job
+            if job is None or job.submission_id != submission_id:
+                return False, f"worker does not hold {submission_id}"
+            if record.lease_deadline < now:
+                return False, f"lease for {submission_id} has expired"
+            record.last_seen = now
+            record.lease_deadline = now + self.worker_lease_ms / 1000.0
+        if stage:
+            self.set_stage(submission_id, stage, worker_id=worker_id)
+        return True, ""
+
+    def accept_worker_result(self, session: Session, submission_id: str, verdict: dict,
+                             backend: str, wall_ms: float) -> Tuple[bool, str]:
+        """Accept a result only from the live lease owner; the first verdict wins."""
+        worker_id = session.worker_id or ""
+        with self._lock:
+            record = self.workers.get(worker_id)
+            if record is None or record.session_id != session.id:
+                return False, "worker is no longer registered"
+            job = record.active_job
+            if job is None or job.submission_id != submission_id:
+                return False, f"worker does not hold {submission_id}"
+            if record.lease_deadline < time.monotonic():
+                return False, f"lease for {submission_id} has expired"
+            record.active_job = None
+            record.lease_deadline = 0.0
+            record.last_seen = time.monotonic()
+
+        accepted = self.record_verdict(
+            submission_id, verdict, backend_name=backend,
+            worker_id=worker_id, wall_ms=wall_ms,
+        )
+        if not accepted:
+            return False, f"{submission_id} already has a verdict"
+        return True, ""
+
+    def expire_worker_leases(self, now: float) -> None:
+        """Eject workers that missed three heartbeats and reclaim their active jobs."""
+        expired_sessions = []
+        with self._lock:
+            for record in list(self.workers.values()):
+                if record.active_job is not None and record.lease_deadline <= now:
+                    session = self.sessions.get(record.session_id)
+                    if session is not None:
+                        expired_sessions.append(session)
+        for session in expired_sessions:
+            self.unregister_worker(session, reason="missed three heartbeats and was ejected")
 
     # -- match lifecycle ---------------------------------------------------
 
@@ -1297,6 +1495,10 @@ class _ClientHandler:
             return self._error(message, Status.METHOD_NOT_ALLOWED,
                                detail=f"unknown method {message.method!r}"), True
 
+        if session.worker_id is not None and not message.method.startswith("WORKER_"):
+            return self._error(message, Status.FORBIDDEN,
+                               detail="a registered worker connection cannot act as a player"), True
+
         if spec.requires_auth and not session.authenticated:
             return self._error(message, Status.AUTH_FAILED,
                                detail=f"{message.method} requires a LOGIN first"), True
@@ -1400,6 +1602,31 @@ class _ClientHandler:
             raise BadRequest(f"body must be a JSON object, not {type(payload).__name__}")
         return payload
 
+    def _worker_identity(self, message: Message) -> Tuple[Optional[str], Optional[Message]]:
+        """Validate the worker id and pre-shared token carried by a worker request."""
+        worker_id = str(message.headers.get("Worker", "")).strip()
+        if not worker_id:
+            return None, self._error(message, Status.BAD_REQUEST,
+                                     detail="WORKER_* requests require a Worker header")
+        for character in worker_id:
+            if not (character.isalnum() or character in USERNAME_EXTRA_CHARS):
+                return None, self._error(
+                    message, Status.BAD_REQUEST,
+                    detail=f"worker ids may contain letters, digits and "
+                           f"{USERNAME_EXTRA_CHARS!r} only",
+                )
+        supplied = str(message.headers.get("Worker-Token", ""))
+        if not secrets.compare_digest(supplied, self.arena.worker_token):
+            return None, self._error(message, Status.AUTH_FAILED,
+                                     detail="worker token was not accepted")
+        if self.session.worker_id is not None and self.session.worker_id != worker_id:
+            return None, self._error(
+                message, Status.FORBIDDEN,
+                detail=f"this connection is registered as {self.session.worker_id!r}, "
+                       f"not {worker_id!r}",
+            )
+        return worker_id, None
+
     @staticmethod
     def _credentials(payload: dict) -> Tuple[str, str]:
         """Pull and validate ``user`` / ``pass`` out of a REGISTER or LOGIN body.
@@ -1437,6 +1664,122 @@ class _ClientHandler:
 
     # -- handshake and accounts --------------------------------------------
 
+    @method("WORKER_REGISTER", requires_auth=False, states=(State.INIT,))
+    def handle_worker_register(self, message: Message) -> Message:
+        """Authenticate a remote judge and add it to the pool."""
+        worker_id, error = self._worker_identity(message)
+        if error is not None:
+            return error
+        assert worker_id is not None
+        payload = self._json_request(message)
+        backend = _header_safe(str(payload.get("backend", "unknown")))
+        try:
+            requested_poll_ms = int(payload.get("poll_wait_ms", MAX_WORKER_POLL_MS))
+        except (TypeError, ValueError) as exc:
+            raise BadRequest(f"poll_wait_ms must be an integer: {exc}") from exc
+        ok, detail = self.arena.register_worker(self.session, worker_id, backend)
+        if not ok:
+            return self._error(message, Status.CONFLICT, detail=detail)
+        return self._ok(message, Status.CREATED, phrase="REGISTERED", headers={
+            "Server": SERVER_NAME,
+            "Heartbeat-Ms": self.arena.worker_heartbeat_ms,
+            "Poll-Timeout-Ms": min(
+                MAX_WORKER_POLL_MS,
+                max(0, requested_poll_ms),
+            ),
+            "Lease-Ms": self.arena.worker_lease_ms,
+        }, detail=f"worker {worker_id} joined the judge pool")
+
+    @method("WORKER_PULL", requires_auth=False)
+    def handle_worker_pull(self, message: Message) -> Message:
+        """Long-poll for a job; an empty, completed poll is ``204 NO_CONTENT``."""
+        worker_id, error = self._worker_identity(message)
+        if error is not None:
+            return error
+        if self.session.worker_id != worker_id:
+            return self._error(message, Status.AUTH_FAILED,
+                               detail="WORKER_REGISTER must succeed before WORKER_PULL")
+        wait_ms = message.headers.get_int("Wait-Ms")
+        if wait_ms is None:
+            wait_ms = MAX_WORKER_POLL_MS
+        wait_ms = min(MAX_WORKER_POLL_MS, max(0, wait_ms))
+        try:
+            job = self.arena.pull_worker_job(self.session, wait_ms)
+        except BadRequest as exc:
+            return self._error(message, Status.CONFLICT, detail=str(exc))
+        if job is None:
+            return self._ok(message, Status.NO_CONTENT,
+                            detail=f"no job became available within {wait_ms}ms")
+
+        problem = get_problem(job.problem_id)
+        body = self._json_body(job.payload)
+        response = self._ok(message, Status.OK, headers={
+            "Submission": job.submission_id,
+            "Problem": job.problem_id,
+            "Time-Limit-Ms": problem.contract.time_limit_ms,
+            "Lease-Ms": self.arena.worker_lease_ms,
+            "Content-Type": "application/json",
+        }, body=body, detail=f"leased {job.submission_id} to {worker_id}")
+        response.attach_body_hash()
+        return response
+
+    @method("WORKER_HEARTBEAT", requires_auth=False)
+    def handle_worker_heartbeat(self, message: Message) -> Message:
+        """Renew the active job lease and forward a stage the worker really observed."""
+        worker_id, error = self._worker_identity(message)
+        if error is not None:
+            return error
+        if self.session.worker_id != worker_id:
+            return self._error(message, Status.AUTH_FAILED,
+                               detail="WORKER_REGISTER must succeed before heartbeats")
+        submission_id = str(message.headers.get("Submission", "")).strip()
+        if not submission_id:
+            return self._error(message, Status.BAD_REQUEST,
+                               detail="WORKER_HEARTBEAT requires a Submission header")
+        stage = str(message.headers.get("Stage", "")).strip().upper()
+        if stage and stage not in JUDGE_STAGES:
+            return self._error(message, Status.BAD_REQUEST,
+                               detail=f"unknown judge stage {stage!r}")
+        ok, detail = self.arena.renew_worker_lease(self.session, submission_id, stage)
+        if not ok:
+            return self._error(message, Status.CONFLICT, detail=detail)
+        return self._ok(message, Status.OK, headers={
+            "Submission": submission_id,
+            "Lease-Ms": self.arena.worker_lease_ms,
+        }, detail=f"lease renewed for {submission_id}")
+
+    @method("WORKER_RESULT", requires_auth=False)
+    def handle_worker_result(self, message: Message) -> Message:
+        """Accept the first result from the worker that owns the live lease."""
+        worker_id, error = self._worker_identity(message)
+        if error is not None:
+            return error
+        if self.session.worker_id != worker_id:
+            return self._error(message, Status.AUTH_FAILED,
+                               detail="WORKER_REGISTER must succeed before WORKER_RESULT")
+        submission_id = str(message.headers.get("Submission", "")).strip()
+        if not submission_id:
+            return self._error(message, Status.BAD_REQUEST,
+                               detail="WORKER_RESULT requires a Submission header")
+        verdict = self._json_request(message)
+        try:
+            code = int(verdict.get("verdict"))
+            format_status(code)  # proves this is a declared 6xx verdict
+            if not 600 <= code < 700:
+                raise ValueError("not a judge verdict")
+            wall_ms = float(message.headers.get("Wall-Ms", "0"))
+        except (TypeError, ValueError, KeyError) as exc:
+            return self._error(message, Status.BAD_REQUEST,
+                               detail=f"invalid worker result: {exc}")
+        backend = _header_safe(str(message.headers.get("Backend", "unknown")))
+        ok, detail = self.arena.accept_worker_result(
+            self.session, submission_id, verdict, backend, wall_ms,
+        )
+        if not ok:
+            return self._error(message, Status.CONFLICT, detail=detail)
+        return self._ok(message, Status.OK, headers={"Submission": submission_id},
+                        detail=f"verdict accepted from {worker_id}")
+
     @method("HELLO", requires_auth=False, states=(State.INIT, State.GREETED))
     def handle_hello(self, message: Message) -> Message:
         """Version handshake. The only method a client may send before anything else.
@@ -1455,8 +1798,9 @@ class _ClientHandler:
             "min_players": self.arena.min_players,
             "languages": ["python"],
             "judge": {
-                "backend": self.arena.pool.backend_name if self.arena.pool else "none",
-                "healthy": bool(self.arena.pool and self.arena.pool.healthy),
+                "backend": self.arena.pool.backend_name if self.arena.pool else "remote",
+                "healthy": self.arena.judge_healthy(),
+                "remote_workers": self.arena.remote_worker_count(),
                 "opcode_counter": self.arena.capabilities.opcode_counter_name,
             },
         })
@@ -1777,8 +2121,7 @@ class _ClientHandler:
         if not source.strip():
             raise BadRequest("the body must contain the source code to judge")
 
-        pool = self.arena.pool
-        if pool is None or not pool.healthy:
+        if not self.arena.judge_healthy():
             # Backpressure, and a truthful one: the submission is *not* recorded, so the
             # cooldown does not start and the player can retry immediately once a judge is
             # available. Accepting it into a queue nothing drains would be worse than
@@ -2021,6 +2364,7 @@ class ArenaServer:
                 self.arena.try_matchmake()
                 self.arena.start_pending_matches(now)
                 self.arena.expire_matches(now)
+                self.arena.expire_worker_leases(now)
             except Exception as exc:                      # noqa: BLE001
                 # This thread must not die. If it did, matches would never start and never
                 # end, and the failure would look like a hang rather than an error.
@@ -2078,6 +2422,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "503 JUDGE_UNAVAILABLE (default: 2)")
     parser.add_argument("--backend", choices=("subprocess", "docker"), default="subprocess",
                         help="how a submission is isolated (default: subprocess)")
+    parser.add_argument("--worker-token", default="",
+                        help="pre-shared token required by remote WORKER_* clients")
+    parser.add_argument("--worker-heartbeat-ms", type=int,
+                        default=DEFAULT_WORKER_HEARTBEAT_MS,
+                        help="remote-worker heartbeat interval; three missed beats eject a "
+                             f"worker (default: {DEFAULT_WORKER_HEARTBEAT_MS})")
     parser.add_argument("--min-players", type=int, default=2,
                         help="players needed to form a match; 1 allows solo testing "
                              "(default: 2)")
@@ -2130,6 +2480,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         problem_id=args.problem,
         room_capacity=max(1, args.room_capacity),
         allow_panic=args.allow_panic,
+        worker_token=args.worker_token,
+        worker_heartbeat_ms=args.worker_heartbeat_ms,
     )
 
     pool = LocalJudgePool(arena, size=max(0, args.judges), backend_name=args.backend)
@@ -2147,7 +2499,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     log.note(f"judges: {args.judges} thread(s), backend={actual}, "
              f"opcode counter={arena.capabilities.opcode_counter_name}")
     if args.judges == 0:
-        log.note("no judge threads — SUBMIT will answer 503 JUDGE_UNAVAILABLE by design")
+        log.note("no local judge threads — SUBMIT answers 503 JUDGE_UNAVAILABLE until a "
+                 "remote worker registers")
+    log.note(f"remote workers: token={'configured' if args.worker_token else 'empty'} "
+             f"heartbeat={arena.worker_heartbeat_ms}ms "
+             f"eject-after={arena.worker_lease_ms}ms")
     if args.allow_panic:
         log.note("DEBUG_PANIC is enabled — 500 INTERNAL_ERROR is reachable on request")
 
