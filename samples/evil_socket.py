@@ -29,6 +29,7 @@
 # Expected verdict: 609 SANDBOX_VIOLATION (guard on). With --no-ast-guard: connects under
 # subprocess, fails under docker.
 
+import os
 import socket
 
 # Attempt to phone home. 8.8.8.8:53 (Google public DNS, TCP) is a stand-in for "any host on
@@ -36,7 +37,12 @@ import socket
 # The point is not the destination — it is that the code can create a socket and reach the
 # network at all.
 try:
-    connection = socket.create_connection(("8.8.8.8", 53), timeout=2.0)
+    # The experiment points this at a loopback listener for a deterministic proof. Docker
+    # receives neither environment variable and keeps the public default, unreachable with
+    # --network none. Normal judging never executes this because the AST guard rejects it.
+    host = os.environ.get("CDAP_PROBE_HOST", "8.8.8.8")
+    port = int(os.environ.get("CDAP_PROBE_PORT", "53"))
+    connection = socket.create_connection((host, port), timeout=2.0)
     connection.close()
     ESCAPED = True          # reached only when the network namespace was accessible
 except OSError:

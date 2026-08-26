@@ -473,9 +473,10 @@ Rather than merely asserting the guard is weak, `experiments/backend_overhead.py
 Two scripts produce the report's quantitative results.
 
 **`experiments/confusion_matrix.py`** — runs every known-complexity reference solution in
-`samples/` through both profiler methods and prints true-vs-inferred. Method A is expected
-≥ 90% on the polynomial cases. Method B should be exact on pure-Python cases **and
-demonstrably wrong on the sort case** — the experiment asserts that contrast rather than
+`samples/` through both profiler methods and prints true-vs-inferred. On the recorded run,
+Method A identified 6/7 polynomial cases (85.7%); the indeterminate set case is retained as an
+honest measurement-noise result. Method B identified 5/7 pure-Python cases and is
+**demonstrably wrong on the sort case** — the experiment asserts that contrast rather than
 hiding it, because it is the most interesting thing the comparison reveals.
 
 **`experiments/backend_overhead.py`** — reports per-submission latency and throughput for both
@@ -528,9 +529,9 @@ Built in phases, each ending in a demoable result and its own commit.
 | 6 | `worker.py` + dispatcher — the judge pool | ✅ done |
 | 7 | UDP feed, stale-drop, `--feed-only`, `--no-udp` | ✅ done |
 | 8 | `DockerBackend` | ✅ done |
-| 9 | Both experiments, three bilingual docs | ⏳ next |
+| 9 | Both experiments, three bilingual docs | ✅ done |
 
-**What runs today:** the capability probe (`python -m cdap.capabilities`), the wire layer
+**What runs today:** the complete project: the capability probe (`python -m cdap.capabilities`), the wire layer
 self-test (`python -m cdap.selftest_protocol`), which frames all three message kinds, verifies
 `Body-SHA256`, refuses to mix the two status namespaces, round-trips the UDP codec, and carries
 two back-to-back frames over a real loopback socket; the judge itself; and, as of Phase 5, a
@@ -570,8 +571,9 @@ are now measured *and* judged.
 `forge_result.py`, which prints a fake `__CDAP_RESULT__` line and is ignored because the real
 one is always last, and `has_duplicate_onlogn.py`, which exists to *fail* Method B.
 
-Everything past Phase 8 is still design only — the sections above describe what the following
-phases implement, and this table is the honest source of truth for what works.
+Both experiments are executable and write machine-readable results under `experiments/out/`.
+The bilingual protocol report is reproducibly generated with `python docs/build_pdf.py` and
+the 14:30 presentation plan includes the full demo matrix.
 
 ---
 
@@ -579,7 +581,7 @@ phases implement, and this table is the honest source of truth for what works.
 
 | Deliverable | Artifact |
 |---|---|
-| PDF — protocol design + answers | `docs/CDAP-protocol-spec.md` + `docs/threat-model.md` |
+| PDF — protocol design + answers | `output/pdf/CDAP-protocol-spec.pdf` (sources in `docs/`) |
 | Source code | this repository |
 | VDO ≤ 15 min | `docs/slides-outline.md` (script + timings + demo matrices) |
 

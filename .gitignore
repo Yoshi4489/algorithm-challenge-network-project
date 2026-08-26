@@ -9,6 +9,7 @@ venv/
 .cdap-tmp/
 *.log
 experiments/out/
+tmp/
 
 # OS / editor
 .DS_Store

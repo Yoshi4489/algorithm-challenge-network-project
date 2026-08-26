@@ -687,6 +687,15 @@ def run_job(job: dict) -> dict:
         "tests": tests,
         "contract": problem.contract.to_json(),
     }
+    # Used only by experiments/backend_overhead.py with the AST guard deliberately off.
+    # The hostile samples record whether their attempted escape reached the OS. Ordinary
+    # judging never asks for this and therefore exposes no submission globals in a verdict.
+    if job.get("report_security_probe"):
+        namespace = getattr(function, "__globals__", {})
+        result["security_probe"] = {
+            "escaped": bool(namespace.get("ESCAPED", False)),
+            "spawned": int(namespace.get("spawned", 0)),
+        }
 
     if not tests["all_passed"]:
         # Report which kind of wrong, so the worker can pick 601 vs 605 vs 608 without

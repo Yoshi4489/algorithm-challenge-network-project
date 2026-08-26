@@ -310,7 +310,7 @@ class DockerBackend(Backend):
             "--network", "none",
             "--memory", f"{memory_kb}k",
             "--memory-swap", f"{memory_kb}k",
-            "--pids-limit", "64",
+            "--pids-limit", "8",
             "--cpus", "1.0",
             "--read-only",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",

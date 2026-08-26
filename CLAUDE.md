@@ -199,14 +199,14 @@ phases land.
    Windows, both degrade gracefully), and that the console needs `sys.stdout.reconfigure`
    to UTF-8 for the wire log's `→ ← ✗` markers — `enable_utf8_output()` handles it, with an
    ASCII fallback if reconfigure fails.
-2. `status.py`, `protocol.py` — framing + the wire logger
-3. `problems.py`, `judge/runner.py`, `judge/sandbox.py`, `judge/backends.py` (subprocess)
-4. `judge/profiler.py` — the model fitter
-5. `server.py` TCP path + `client.py` — a full duel, every protocol status reachable
-6. `judge/worker.py` + dispatcher — the pool, health ejection, `503` backpressure
-7. UDP feed, stale-drop, `--feed-only`, `--no-udp`
-8. `DockerBackend`
-9. Both experiments + the three bilingual docs
+2. `status.py`, `protocol.py` — framing + the wire logger ✅
+3. `problems.py`, `judge/runner.py`, `judge/sandbox.py`, `judge/backends.py` (subprocess) ✅
+4. `judge/profiler.py` — the model fitter ✅
+5. `server.py` TCP path + `client.py` — a full duel, every protocol status reachable ✅
+6. `judge/worker.py` + dispatcher — the pool, health ejection, `503` backpressure ✅
+7. UDP feed, stale-drop, `--feed-only`, `--no-udp` ✅
+8. `DockerBackend` ✅
+9. Both experiments + the three bilingual docs ✅
 
 Phase 8 is deliberately late: everything works without Docker, so if Docker Desktop misbehaves
 it costs one experiment, not the project.

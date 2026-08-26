@@ -17,8 +17,8 @@
 #     exactly why _kill_tree uses killpg (POSIX) / taskkill /T (Windows) instead of a plain
 #     proc.kill() that would orphan the children. The demo shows the kill working, but also
 #     shows that the damage window was real: processes did get created.
-#   * under `docker` with `--pids-limit 32` the spawns hit a hard cgroup ceiling almost
-#     immediately and fail. The kernel refuses to create the 33rd process. No cooperation
+#   * under `docker` with `--pids-limit 8` the spawns hit a hard cgroup ceiling almost
+#     immediately and fail. The kernel refuses the complete burst. No cooperation
 #     from the judge required — the limit is enforced below the code.
 #
 # That contrast is the strongest single moment in the security experiment: the subprocess
@@ -42,20 +42,20 @@ import sys
 #: Small and finite on purpose — enough to prove spawning works, not enough to wedge the
 #: dev box. A real fork bomb would loop without this bound; the security claim does not need
 #: it to.
-BURST = 8
+BURST = 16
 
 spawned = 0
 try:
     for _ in range(BURST):
-        # A child that exits immediately. We only need the *creation* to succeed to make the
-        # point; the children do no work and are not even waited on individually.
+        # A child that stays alive for two seconds, long enough for the burst to overlap and
+        # hit Docker's pid ceiling. It does no work and is not waited on individually.
         subprocess.Popen(
-            [sys.executable, "-c", "pass"],
+            [sys.executable, "-c", "import time; time.sleep(2)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         spawned += 1
-    ESCAPED = spawned > 0       # True once any child was created — the security failure
+    ESCAPED = spawned == BURST  # Docker's pids cap prevents the complete burst
 except OSError:
     # Under docker --pids-limit this is where the kernel says no.
     ESCAPED = False

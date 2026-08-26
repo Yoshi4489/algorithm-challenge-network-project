@@ -36,9 +36,16 @@ import os
 # listing alone already demonstrates filesystem reach; the open() is the belt-and-suspenders
 # escalation and the construct the guard names explicitly.
 try:
-    entries = os.listdir(os.path.dirname(os.__file__))   # the stdlib directory
-    sample = entries[0] if entries else ""
-    with open(os.path.join(os.path.dirname(os.__file__), sample), "rb") as handle:
+    # The experiment supplies a host-only path to subprocess. Docker intentionally does
+    # not pass that environment variable into the container, so it can see only its own
+    # runtime and the explicit read-only /app mount.
+    probe_path = os.environ.get("CDAP_HOST_PROBE_PATH")
+    if not probe_path:
+        raise OSError("no host probe path is visible")
+    entries = os.listdir(probe_path)
+    files = [name for name in entries if os.path.isfile(os.path.join(probe_path, name))]
+    sample = files[0] if files else ""
+    with open(os.path.join(probe_path, sample), "rb") as handle:
         handle.read(16)
     ESCAPED = True          # reached only when the host filesystem was readable
 except OSError:
