@@ -44,6 +44,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -215,17 +216,7 @@ class SubprocessBackend(Backend):
             **_process_group_kwargs(),
         )
 
-        timed_out = False
-        try:
-            out, err = proc.communicate(input=payload, timeout=deadline_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_tree(proc)
-            # Drain whatever the child produced before the kill; ignore a second timeout.
-            try:
-                out, err = proc.communicate(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                out, err = b"", b""
+        out, err, timed_out = _communicate_bounded(proc, payload, deadline_s)
 
         return _Completed(
             stdout=_decode_cap(out),
@@ -335,17 +326,9 @@ class DockerBackend(Backend):
             stderr=subprocess.PIPE,
             **_process_group_kwargs(),
         )
-        timed_out = False
-        try:
-            out, err = proc.communicate(input=payload, timeout=deadline_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self._remove_container(container_name)
-            _kill_tree(proc)
-            try:
-                out, err = proc.communicate(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                out, err = b"", b""
+        out, err, timed_out = _communicate_bounded(
+            proc, payload, deadline_s, on_timeout=lambda: self._remove_container(container_name)
+        )
         wall_ms = (time.perf_counter() - start) * 1000.0
         stdout = _decode_cap(out)
         stderr = _decode_cap(err)
@@ -465,10 +448,58 @@ def _extract_result(stdout: str) -> Optional[dict]:
 def _decode_cap(raw: bytes) -> str:
     """Decode captured bytes to text, truncating past the output cap with a marker."""
     if len(raw) > MAX_OUTPUT_BYTES:
-        raw = raw[:MAX_OUTPUT_BYTES]
+        # Keep the tail: the runner's result sentinel is emitted last.
+        head = MAX_OUTPUT_BYTES // 2
+        raw = raw[:head] + b"\n...[truncated at 64 KB]...\n" + raw[-(MAX_OUTPUT_BYTES - head):]
         suffix = b"\n...[truncated at 64 KB]..."
         raw = raw + suffix
     return raw.decode("utf-8", errors="replace")
+
+
+def _communicate_bounded(proc, payload: bytes, timeout: float, on_timeout=None):
+    """Exchange one bounded job without buffering arbitrary child output in memory."""
+    captured = {"out": bytearray(), "err": bytearray()}
+
+    def drain(stream, key):
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                remaining = MAX_OUTPUT_BYTES - len(captured[key])
+                if remaining > 0:
+                    captured[key].extend(chunk[:remaining])
+        except (OSError, ValueError):
+            return
+
+    readers = [
+        threading.Thread(target=drain, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=drain, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            if on_timeout is not None:
+                on_timeout()
+            _kill_tree(proc)
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        for reader in readers:
+            reader.join(timeout=5.0)
+    return bytes(captured["out"]), bytes(captured["err"]), timed_out
 
 
 def _rmtree_quiet(path: str) -> None:

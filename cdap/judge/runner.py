@@ -671,7 +671,7 @@ def run_job(job: dict) -> dict:
         return _failed("compile_error", f"line {exc.lineno}: {exc.msg}")
     except NameError as exc:
         return _failed("compile_error", str(exc))
-    except Exception as exc:                         # noqa: BLE001
+    except BaseException as exc:                     # noqa: BLE001
         # Covers SandboxViolation and anything raised at module level by the submission
         # itself (a solution whose top-level code divides by zero lands here).
         kind = "sandbox_violation" if type(exc).__name__ == "SandboxViolation" else "runtime_error"
@@ -755,7 +755,7 @@ def main() -> int:
 
     try:
         result = run_job(job)
-    except Exception as exc:                         # noqa: BLE001 - last line of defence
+    except BaseException as exc:                     # noqa: BLE001 - last line of defence
         result = _failed("judge_error", f"{type(exc).__name__}: {exc}")
 
     # The sentinel goes last, on its own line, and is flushed explicitly — a killed child

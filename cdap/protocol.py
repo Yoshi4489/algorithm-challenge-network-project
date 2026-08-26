@@ -393,13 +393,13 @@ def parse_start_line(line: str) -> dict:
     return {"kind": Kind.REQUEST, "version": version, "method": second}
 
 
-def _read_line(reader) -> str:
+def _read_line(reader) -> Optional[str]:
     """Read one CRLF-terminated line, enforcing the header size limit."""
     raw = reader.readline(MAX_HEADER_BYTES + 1)
     if len(raw) > MAX_HEADER_BYTES:
         raise FrameTooLarge("header line exceeded MAX_HEADER_BYTES")
     if not raw:
-        return ""  # EOF
+        return None  # EOF (distinct from a CRLF blank line)
     return raw.decode("utf-8", errors="replace").rstrip("\r\n")
 
 
@@ -415,7 +415,7 @@ def read_message(reader):
     belong to the next frame.
     """
     start = _read_line(reader)
-    if start == "":
+    if start is None or start == "":
         return None  # peer closed cleanly between frames
 
     parts = parse_start_line(start)
@@ -424,6 +424,8 @@ def read_message(reader):
 
     while True:
         line = _read_line(reader)
+        if line is None:
+            raise ProtocolError("truncated frame while reading headers")
         if line == "":
             # A blank line ends the header block. A truly closed socket would have
             # ended at the start line, so reaching EOF here means a truncated frame.
@@ -438,8 +440,15 @@ def read_message(reader):
             raise ProtocolError(f"header line has no colon: {line!r}")
         headers[name.strip()] = value.strip()
 
-    length = headers.get_int("Content-Length", 0)
-    if length is None or length < 0:
+    raw_length = headers.get("Content-Length")
+    if raw_length is None:
+        length = 0
+    else:
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            raise ProtocolError(f"invalid Content-Length: {raw_length!r}") from None
+    if length < 0:
         raise ProtocolError(f"invalid Content-Length: {headers.get('Content-Length')!r}")
     if length > MAX_BODY_BYTES:
         # Refuse before allocating. The server still owes the peer a 413, but that

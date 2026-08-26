@@ -235,6 +235,10 @@ class BadRequest(Exception):
     """
 
 
+class SubmissionClosed(Exception):
+    """The match changed state while a SUBMIT request was being validated."""
+
+
 # --------------------------------------------------------------------------
 # Sessions
 # --------------------------------------------------------------------------
@@ -853,14 +857,17 @@ class Arena:
 
     def start_room_match(self, room: Room) -> Optional[Match]:
         with self._lock:
+            # READY handlers run concurrently. Only the first deferred action may consume
+            # the room; repeated READY frames must not create duplicate matches.
+            if self.rooms.get(room.code) is not room:
+                return None
+            self.rooms.pop(room.code, None)
             players = [self.sessions[sid] for sid in room.session_ids if sid in self.sessions]
             if not players:
-                self.rooms.pop(room.code, None)
                 return None
             match = self._create_match_locked(players)
             if room.problem_id:
                 match.problem_id = room.problem_id
-            self.rooms.pop(room.code, None)
         self._announce_match_found(match)
         return match
 
@@ -929,6 +936,11 @@ class Arena:
         assigned.
         """
         with self._lock:
+            if (self.sessions.get(session.id) is not session
+                    or session.match_id != match.id
+                    or match.state is not MatchState.RUNNING
+                    or time.monotonic() >= match.deadline):
+                raise SubmissionClosed("match is no longer accepting submissions")
             submission = Submission(
                 id=self._next_submission_id(),
                 session_id=session.id,
@@ -2185,7 +2197,17 @@ class _ClientHandler:
                                detail="no judge is available to run this submission; "
                                       "try again shortly")
 
-        submission, position = self.arena.create_submission(session, match, lang, source)
+        try:
+            submission, position = self.arena.create_submission(session, match, lang, source)
+        except SubmissionClosed:
+            # The tick thread may have ended the match after the checks above. Do not record
+            # a source; return the state that won the race.
+            current = self.arena.current_match(session)
+            if current is None or current.state is MatchState.ENDED:
+                return self._error(message, Status.MATCH_ENDED, headers={"Match": match.id},
+                                   detail=f"match {match.id} ended; submissions closed")
+            return self._error(message, Status.FORBIDDEN, phrase="WRONG_STATE",
+                               detail="the clock has not started yet; wait for MATCH_START")
         # Queue it only after the 202 is on the wire — see Arena.create_submission for why
         # a fast verdict beating its own submission id is a real problem and not a
         # theoretical one.
