@@ -79,6 +79,8 @@ from .protocol import (
     Message,
     ProtocolError,
     WireLog,
+    decode_datagram,
+    encode_datagram,
 )
 from .status import Status, Verdict, format_status
 from .judge.backends import make_backend
@@ -1326,6 +1328,59 @@ class Arena:
         with self._lock:
             return list(self.sessions.values())
 
+    def session_for_feed_token(self, token: str) -> Optional[Session]:
+        """Resolve a display-scoped UDP attach token to its logged-in TCP session."""
+        with self._lock:
+            for session in self.sessions.values():
+                if session.authenticated and session.token == token:
+                    return session
+        return None
+
+    def feed_session_alive(self, session_id: str, user: str) -> bool:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            return bool(session and session.authenticated and session.user == user)
+
+    def feed_snapshots(self, now: float) -> List[dict]:
+        """Copy the display-only state used to build UDP TICK/CLOCK/BOARD datagrams."""
+        snapshots = []
+        with self._lock:
+            for match in self.matches.values():
+                if match.state is not MatchState.RUNNING:
+                    continue
+                problem = get_problem(match.problem_id)
+                total = len(problem.tests)
+                players = []
+                for session_id in match.session_ids:
+                    session = self.sessions.get(session_id)
+                    if session is None or session.user is None:
+                        continue
+                    attempts = [
+                        self.submissions[sub_id]
+                        for sub_id in match.submissions
+                        if sub_id in self.submissions
+                        and self.submissions[sub_id].session_id == session_id
+                    ]
+                    passed = 0
+                    for attempt in attempts:
+                        text = str((attempt.verdict or {}).get("tests_passed", "0/0"))
+                        try:
+                            passed = max(passed, int(text.partition("/")[0]))
+                        except ValueError:
+                            pass
+                    players.append({
+                        "user": session.user,
+                        "passed": passed,
+                        "total": total,
+                        "subs": len(attempts),
+                    })
+                snapshots.append({
+                    "match": match.id,
+                    "remain": match.remaining_ms(now),
+                    "players": players,
+                })
+        return snapshots
+
     def broadcast_shutdown(self) -> None:
         for session in self.all_sessions():
             session.push_event("SERVER_SHUTDOWN", headers={
@@ -2243,24 +2298,34 @@ class ArenaServer:
 
         self.stopping = False
         self._listener: Optional[socket.socket] = None
+        self._udp_socket: Optional[socket.socket] = None
         self._threads: List[threading.Thread] = []
+        self._udp_lock = threading.Lock()
+        # user -> {UDP source address -> authenticated TCP session id}. Keeping the session
+        # id lets the broadcaster discard an endpoint as soon as its attach session closes.
+        self._feed_endpoints: Dict[str, dict] = {}
+        self._feed_seq: Dict[str, int] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
     def serve_forever(self) -> None:
         """Bind, then accept until stopped. Returns once shutdown is complete."""
         self._listener = self._bind()
+        if self.udp_port:
+            self._udp_socket = self._bind_udp()
         tick = threading.Thread(target=self._tick_loop, name="tick", daemon=True)
         tick.start()
+
+        if self._udp_socket is not None:
+            udp = threading.Thread(target=self._udp_loop, name="udp-feed", daemon=True)
+            udp.start()
+            self._threads.append(udp)
 
         self.log.note(f"arena listening on {self.host}:{self.tcp_port} (TCP) — "
                       f"protocol {PROTOCOL_VERSION}")
         if self.udp_port:
-            # Said plainly rather than implied. Announcing a port nothing is bound to would
-            # be exactly the kind of quiet lie the honesty rules elsewhere in this project
-            # exist to prevent.
-            self.log.note(f"UDP feed port {self.udp_port} reserved — the feed itself "
-                          f"arrives in Phase 7; matches are fully playable without it")
+            self.log.note(f"live feed listening on {self.host}:{self.udp_port} (UDP) — "
+                          "display-only; matches remain correct if every datagram is lost")
 
         try:
             self._accept_loop()
@@ -2282,6 +2347,12 @@ class ArenaServer:
         # interrupt after the next connection — which, on an idle server, is never.
         listener.settimeout(0.5)
         return listener
+
+    def _bind_udp(self) -> socket.socket:
+        feed = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        feed.bind((self.host, int(self.udp_port or 0)))
+        feed.settimeout(0.5)
+        return feed
 
     def _accept_loop(self) -> None:
         assert self._listener is not None
@@ -2365,10 +2436,113 @@ class ArenaServer:
                 self.arena.start_pending_matches(now)
                 self.arena.expire_matches(now)
                 self.arena.expire_worker_leases(now)
+                self._broadcast_udp(now)
             except Exception as exc:                      # noqa: BLE001
                 # This thread must not die. If it did, matches would never start and never
                 # end, and the failure would look like a hang rather than an error.
                 self.log.note(f"tick failed: {exc!r}")
+
+    # -- UDP live feed ----------------------------------------------------
+
+    def _udp_loop(self) -> None:
+        """Learn client endpoints from ATTACH datagrams; never changes match state."""
+        feed = self._udp_socket
+        if feed is None:
+            return
+        while not self.stopping:
+            try:
+                data, address = feed.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            peer = f"{address[0]}:{address[1]}"
+            try:
+                if not data.startswith((PROTOCOL_VERSION + " ").encode("ascii")):
+                    raise ProtocolError(f"UDP feed requires {PROTOCOL_VERSION}")
+                kind, fields = decode_datagram(data)
+            except (ProtocolError, FrameTooLarge) as exc:
+                self.log.udp_dropped(f"malformed datagram from {peer}: {exc}")
+                continue
+            self.log.udp_received(kind, fields, peer=peer)
+            if kind != "ATTACH":
+                self.log.udp_dropped(f"{kind} from {peer}: clients may send ATTACH only")
+                continue
+            token = str(fields.get("session", ""))
+            session = self.arena.session_for_feed_token(token)
+            if session is None or session.user is None:
+                self.log.udp_dropped(f"ATTACH from {peer}: unknown or expired session token")
+                continue
+            with self._udp_lock:
+                self._feed_endpoints.setdefault(session.user, {})[address] = session.id
+            self.log.note(f"UDP feed attached for {session.user} from source address {peer}")
+
+    def _broadcast_udp(self, now: float) -> None:
+        """Send current display snapshots. No caller relies on delivery or ordering."""
+        if self._udp_socket is None:
+            return
+        for snapshot in self.arena.feed_snapshots(now):
+            players = snapshot["players"]
+            targets = self._feed_targets([player["user"] for player in players])
+            if not targets:
+                continue
+            match_id = snapshot["match"]
+            self._send_feed("CLOCK", {
+                "match": match_id,
+                "seq": self._next_feed_seq(match_id),
+                "remain": snapshot["remain"],
+            }, targets)
+            for player in players:
+                self._send_feed("TICK", {
+                    "match": match_id,
+                    "seq": self._next_feed_seq(match_id),
+                    "t": int(time.time() * 1000),
+                    "player": player["user"],
+                    "passed": player["passed"],
+                    "total": player["total"],
+                    "subs": player["subs"],
+                }, targets)
+            board = ",".join(
+                f"{player['user']}:{player['passed']}:{player['subs']}"
+                for player in players
+            )
+            self._send_feed("BOARD", {
+                "match": match_id,
+                "seq": self._next_feed_seq(match_id),
+                "e": board,
+            }, targets)
+
+    def _feed_targets(self, users: List[str]) -> set:
+        with self._udp_lock:
+            targets = set()
+            for user in users:
+                endpoints = self._feed_endpoints.get(user, {})
+                for address, session_id in list(endpoints.items()):
+                    if self.arena.feed_session_alive(session_id, user):
+                        targets.add(address)
+                    else:
+                        endpoints.pop(address, None)
+                if not endpoints:
+                    self._feed_endpoints.pop(user, None)
+            return targets
+
+    def _next_feed_seq(self, match_id: str) -> int:
+        with self._udp_lock:
+            value = self._feed_seq.get(match_id, 0) + 1
+            self._feed_seq[match_id] = value
+            return value
+
+    def _send_feed(self, kind: str, fields: dict, targets: set) -> None:
+        feed = self._udp_socket
+        if feed is None:
+            return
+        data = encode_datagram(kind, fields)
+        for address in targets:
+            try:
+                feed.sendto(data, address)
+                self.log.udp_sent(kind, fields, peer=f"{address[0]}:{address[1]}")
+            except OSError as exc:
+                self.log.udp_dropped(f"send to {address[0]}:{address[1]} failed: {exc}")
 
     def stop(self) -> None:
         """Shut down once: tell the players, stop the judges, close the socket."""
@@ -2397,6 +2571,11 @@ class ArenaServer:
                 self._listener.close()
             except OSError:
                 pass
+        if self._udp_socket is not None:
+            try:
+                self._udp_socket.close()
+            except OSError:
+                pass
         for session in sessions:
             session.conn.close()
         self.log.note("arena stopped")
@@ -2416,7 +2595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tcp-port", type=int, default=5050,
                         help="TCP port for the request/response protocol (default: 5050)")
     parser.add_argument("--udp-port", type=int, default=5051,
-                        help="UDP port for the live progress feed (Phase 7; default: 5051)")
+                        help="UDP port for the live progress feed; 0 disables it (default: 5051)")
     parser.add_argument("--judges", type=int, default=2,
                         help="in-process judge threads; 0 makes SUBMIT answer "
                              "503 JUDGE_UNAVAILABLE (default: 2)")

@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import random
 import socket
 import sys
 import threading
@@ -66,6 +67,9 @@ from .protocol import (
     Message,
     ProtocolError,
     WireLog,
+    LatestWins,
+    decode_datagram,
+    encode_datagram,
 )
 from .status import Status, describe_status, format_status, is_success
 
@@ -86,6 +90,84 @@ TERMINAL_EVENTS = ("MATCH_END", "SERVER_SHUTDOWN")
 
 class ClientError(Exception):
     """The connection is gone, or the server said something the client cannot use."""
+
+
+class UdpFeed:
+    """Display-only UDP receiver: attach, drop stale/lost values, render the newest state."""
+
+    def __init__(self, host: str, port: int, token: str, log: WireLog,
+                 loss_probability: float = 0.0):
+        self.host = host
+        self.port = port
+        self.token = token
+        self.log = log
+        self.loss_probability = loss_probability
+        self.latest = LatestWins()
+        self.closed = False
+        self.sock: Optional[socket.socket] = None
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("0.0.0.0", 0))
+        sock.settimeout(0.5)
+        self.sock = sock
+        fields = {"session": self.token}
+        data = encode_datagram("ATTACH", fields)
+        sock.sendto(data, (self.host, self.port))
+        self.log.udp_sent("ATTACH", fields, peer=f"{self.host}:{self.port}")
+        self.thread = threading.Thread(target=self._receive_loop, name="udp-feed", daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.closed = True
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=1.0)
+
+    def _receive_loop(self) -> None:
+        assert self.sock is not None
+        while not self.closed:
+            try:
+                data, address = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            peer = f"{address[0]}:{address[1]}"
+            try:
+                if not data.startswith((PROTOCOL_VERSION + " ").encode("ascii")):
+                    raise ProtocolError(f"UDP feed requires {PROTOCOL_VERSION}")
+                kind, fields = decode_datagram(data)
+            except (ProtocolError, FrameTooLarge) as exc:
+                self.log.udp_dropped(f"malformed datagram from {peer}: {exc}")
+                continue
+
+            if self.loss_probability and random.random() < self.loss_probability:
+                self.log.udp_dropped(
+                    f"simulated loss kind={kind} match={fields.get('match', '?')} "
+                    f"seq={fields.get('seq', '?')}"
+                )
+                continue
+
+            match_id = fields.get("match")
+            try:
+                seq = int(fields["seq"])
+            except (KeyError, TypeError, ValueError):
+                self.log.udp_dropped(f"{kind} from {peer}: missing numeric seq")
+                continue
+            if not match_id:
+                self.log.udp_dropped(f"{kind} from {peer}: missing match")
+                continue
+            if not self.latest.accept(match_id, seq):
+                highest = self.latest.highest(match_id)
+                self.log.udp_dropped(f"stale seq={seq} <= {highest}, dropped")
+                continue
+            self.log.udp_received(kind, fields, peer=peer)
 
 
 class _Pending:
@@ -744,7 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="arena host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=5050, help="arena TCP port (default: 5050)")
     parser.add_argument("--udp-port", type=int, default=5051,
-                        help="arena UDP feed port (Phase 7; default: 5051)")
+                        help="arena UDP live-feed port (default: 5051)")
     parser.add_argument("--user", default="alice", help="username (default: alice)")
     parser.add_argument("--pass", dest="password", default="secret",
                         help="password (default: secret — this is a coursework arena)")
@@ -767,13 +849,13 @@ def build_parser() -> argparse.ArgumentParser:
                       help="the Lang header to send; --lang rust → 415 "
                            "UNSUPPORTED_LANGUAGE")
     demo.add_argument("--feed-only", action="store_true",
-                      help="render only the UDP progress feed (Phase 7)")
+                      help="keep an authenticated pane open for UDP progress datagrams")
     demo.add_argument("--no-udp", action="store_true",
                       help="do not attach to the UDP feed — proves the match completes "
                            "over TCP alone (design invariant 1)")
     demo.add_argument("--udp-loss", type=float, default=0.0, metavar="P",
                       help="drop this fraction of received datagrams, to show the feed "
-                           "converging under loss (Phase 7)")
+                           "converging under loss")
 
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="add full headers and body previews to the wire log. The "
@@ -791,18 +873,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     log = WireLog(stream=sys.stdout, verbose=args.verbose, prefix="")
 
-    # The UDP flags are accepted now so the command line is stable across phases, but the
-    # feed itself is Phase 7. Saying so is the point: a client that quietly rendered
-    # nothing under --feed-only would be indistinguishable from a broken feed, and this
-    # project's whole argument about the UDP channel rests on being able to tell those two
-    # apart.
-    if args.feed_only:
-        log.note("--feed-only needs the UDP feed, which arrives in Phase 7. "
-                 "Run without it for the TCP request/response log.")
+    if not 0.0 <= args.udp_loss <= 1.0:
+        log.note("--udp-loss must be between 0.0 and 1.0")
+        return 2
+    if args.feed_only and args.no_udp:
+        log.note("--feed-only and --no-udp contradict each other")
         return 2
     if args.udp_loss:
-        log.note(f"--udp-loss {args.udp_loss} noted; it takes effect once the Phase 7 "
-                 f"feed exists")
+        log.note(f"--udp-loss {args.udp_loss}: received datagrams will be randomly dropped")
     if args.no_udp:
         log.note("--no-udp: TCP only. Nothing in a match depends on the feed "
                  "(design invariant 1), so this changes the display and nothing else.")
@@ -812,6 +890,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         tamper=args.tamper,
                         lang=args.lang,
                         auto_submit=args.submit)
+    feed: Optional[UdpFeed] = None
 
     try:
         client.connect()
@@ -833,7 +912,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         return 1
 
+    if not args.no_udp:
+        if not client.token:
+            log.note("LOGIN returned no feed token; continuing over TCP only")
+        else:
+            try:
+                feed = UdpFeed(args.host, args.udp_port, client.token, log,
+                               loss_probability=args.udp_loss)
+                feed.start()
+                log.note(f"UDP feed attached on port {args.udp_port}; it carries display "
+                         "data only")
+            except OSError as exc:
+                log.note(f"UDP feed unavailable ({exc}); continuing over TCP only")
+                feed = None
+
     try:
+        if args.feed_only:
+            log.note("feed-only pane ready; use the same --user in a playing TCP client")
+            return _wait_feed_only(client)
+
         if args.queue:
             response = client.request("QUEUE")
             log.note(f"QUEUE → {describe_status(response.status, response.phrase)}")
@@ -846,6 +943,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.note(str(exc))
         return 1
     finally:
+        if feed is not None:
+            feed.close()
         client.close()
     return 0
 
@@ -868,6 +967,16 @@ def _wait_for_verdict(client: CdapClient, log: WireLog, timeout: float = 180.0) 
         time.sleep(0.2)
     log.note(f"no verdict within {timeout:.0f}s")
     return 1
+
+
+def _wait_feed_only(client: CdapClient) -> int:
+    """Keep the authenticated attach token alive while the UDP-only pane is displayed."""
+    try:
+        while not client.closed:
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        return 0
+    return 0
 
 
 if __name__ == "__main__":
