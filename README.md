@@ -527,8 +527,8 @@ Built in phases, each ending in a demoable result and its own commit.
 | 5 | `server.py` TCP path, `client.py` — a full duel | ✅ done |
 | 6 | `worker.py` + dispatcher — the judge pool | ✅ done |
 | 7 | UDP feed, stale-drop, `--feed-only`, `--no-udp` | ✅ done |
-| 8 | `DockerBackend` | ⏳ next |
-| 9 | Both experiments, three bilingual docs | ⬜ |
+| 8 | `DockerBackend` | ✅ done |
+| 9 | Both experiments, three bilingual docs | ⏳ next |
 
 **What runs today:** the capability probe (`python -m cdap.capabilities`), the wire layer
 self-test (`python -m cdap.selftest_protocol`), which frames all three message kinds, verifies
@@ -551,6 +551,7 @@ python -m cdap.judge.worker --id w1 --token demo                 # separate work
 python -m cdap.client --user alice --feed-only                   # separate UDP pane
 python -m cdap.client --user bob --queue --no-udp                # TCP-only correctness
 python -m cdap.client --user alice --udp-loss 0.4                # convergence under loss
+python -m cdap.server --backend docker                            # kernel isolation
 ```
 
 `cdap.judge.backends` is the end-to-end judge minus the decision: it runs a submission in a
@@ -569,7 +570,7 @@ are now measured *and* judged.
 `forge_result.py`, which prints a fake `__CDAP_RESULT__` line and is ignored because the real
 one is always last, and `has_duplicate_onlogn.py`, which exists to *fail* Method B.
 
-Everything past Phase 7 is still design only — the sections above describe what the following
+Everything past Phase 8 is still design only — the sections above describe what the following
 phases implement, and this table is the honest source of truth for what works.
 
 ---

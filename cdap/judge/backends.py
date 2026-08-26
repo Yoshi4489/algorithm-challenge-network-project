@@ -8,7 +8,7 @@ report's security experiment is a direct comparison of them:
   container, so no setup cost and it runs anywhere, but the isolation is only as strong as
   what one OS process can deny another. On Windows that is notably weak (no ``setrlimit``,
   no cgroups), which is stated openly rather than hidden.
-* ``DockerBackend`` (Phase 8) — the same child inside ``python:3.14-slim`` with
+* ``DockerBackend`` — the same child inside ``python:3.14-slim`` with
   ``--network none``, a real memory cgroup, and a pid cap. Slower to start, genuinely
   isolated at the kernel.
 
@@ -45,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -245,6 +246,190 @@ class SubprocessBackend(Backend):
         )
 
 
+class DockerBackend(Backend):
+    """Run the same harness inside a locked-down, disposable Docker container.
+
+    The container—not the AST guard—is the security boundary. The repository is mounted
+    read-only only so the standard-library runner and problem catalogue are available;
+    submitted source still arrives solely through stdin. Network, Linux capabilities,
+    privilege escalation, excess processes, writable rootfs, and memory growth are denied
+    by the engine before contestant code starts.
+    """
+
+    name = "docker"
+    image = "python:3.14-slim"
+
+    def __init__(self, docker: str = "docker", repo_root: Optional[Path] = None):
+        self.docker = docker
+        self.repo_root = repo_root or Path(__file__).resolve().parents[2]
+        self._availability: Optional[tuple] = None
+
+    def available(self) -> tuple:
+        if self._availability is not None:
+            return self._availability
+        try:
+            probe = subprocess.run(
+                [self.docker, "info", "--format", "{{.ServerVersion}}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5.0,
+                check=False,
+            )
+        except FileNotFoundError:
+            self._availability = (False, "Docker CLI was not found")
+        except subprocess.TimeoutExpired:
+            self._availability = (False, "Docker daemon did not answer within 5 seconds")
+        except OSError as exc:
+            self._availability = (False, f"Docker probe failed: {exc}")
+        else:
+            if probe.returncode == 0:
+                version = probe.stdout.decode("utf-8", errors="replace").strip()
+                self._availability = (True, f"Docker daemon {version or 'available'}")
+            else:
+                error = probe.stderr.decode("utf-8", errors="replace").strip()
+                self._availability = (False, error or "Docker daemon is unavailable")
+        return self._availability
+
+    def run(self, job: dict, time_limit_ms: int) -> RunResult:
+        available, reason = self.available()
+        if not available:
+            return RunResult(ok=False, backend=self.name,
+                             error=f"Docker is unavailable: {reason}")
+        image_ready, image_reason = self._ensure_image()
+        if not image_ready:
+            return RunResult(ok=False, backend=self.name,
+                             error=f"Docker image is unavailable: {image_reason}")
+
+        payload = json.dumps(job).encode("utf-8")
+        deadline_s = max(1.0, time_limit_ms / 1000.0) + KILL_GRACE_S
+        container_name = f"cdap-run-{uuid.uuid4().hex[:12]}"
+        memory_kb = self._memory_limit_kb(job)
+        mount = f"type=bind,src={self.repo_root},dst=/app,readonly"
+        command = [
+            self.docker, "run", "--rm", "--interactive", "--name", container_name,
+            "--network", "none",
+            "--memory", f"{memory_kb}k",
+            "--memory-swap", f"{memory_kb}k",
+            "--pids-limit", "64",
+            "--cpus", "1.0",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--user", "65534:65534",
+            "--mount", mount,
+            "--workdir", "/tmp",
+            "--env", "PYTHONPATH=/app",
+            "--env", "PYTHONHASHSEED=0",
+            "--env", "PYTHONUNBUFFERED=1",
+            "--env", "PYTHONDONTWRITEBYTECODE=1",
+            self.image,
+            "python", "-m", "cdap.judge.runner",
+        ]
+
+        start = time.perf_counter()
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **_process_group_kwargs(),
+        )
+        timed_out = False
+        try:
+            out, err = proc.communicate(input=payload, timeout=deadline_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._remove_container(container_name)
+            _kill_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                out, err = b"", b""
+        wall_ms = (time.perf_counter() - start) * 1000.0
+        stdout = _decode_cap(out)
+        stderr = _decode_cap(err)
+
+        if timed_out:
+            return RunResult(
+                ok=False, backend=self.name, timed_out=True, killed=True,
+                exit_code=proc.returncode, wall_ms=wall_ms,
+                stdout=stdout, stderr=stderr,
+                error=f"container killed after {deadline_s:.1f}s wall-clock",
+            )
+
+        result = _extract_result(stdout)
+        if result is None:
+            tail = stderr.strip().splitlines()[-1:] if stderr.strip() else []
+            hint = tail[0] if tail else "no output on stderr"
+            return RunResult(
+                ok=False, backend=self.name, exit_code=proc.returncode,
+                wall_ms=wall_ms, stdout=stdout, stderr=stderr,
+                error=f"container exited with code {proc.returncode} and produced no "
+                      f"result line (last stderr: {hint})",
+            )
+        return RunResult(
+            ok=True, backend=self.name, result=result, exit_code=proc.returncode,
+            wall_ms=wall_ms, stdout=stdout, stderr=stderr,
+        )
+
+    @staticmethod
+    def _memory_limit_kb(job: dict) -> int:
+        requested = job.get("mem_limit_kb")
+        if requested is None:
+            try:
+                from ..problems import get_problem
+                requested = get_problem(str(job.get("problem", ""))).contract.mem_limit_kb
+            except (KeyError, ValueError):
+                requested = 64 * 1024
+        # A cgroup measures the whole interpreter while the contract measures contestant
+        # auxiliary memory. Reserve 64 MB for Python/runtime state; the in-child tracemalloc
+        # check still enforces the exact auxiliary-space contract.
+        return max(128 * 1024, int(requested) + 64 * 1024)
+
+    def _ensure_image(self) -> tuple:
+        """Provision the fixed runner image before the submission stopwatch starts."""
+        try:
+            inspected = subprocess.run(
+                [self.docker, "image", "inspect", self.image],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"image inspection failed: {exc}"
+        if inspected.returncode == 0:
+            return True, ""
+        try:
+            pulled = subprocess.run(
+                [self.docker, "pull", self.image],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=180.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"pull failed: {exc}"
+        if pulled.returncode == 0:
+            return True, ""
+        error = pulled.stderr.decode("utf-8", errors="replace").strip()
+        return False, error or f"docker pull exited with {pulled.returncode}"
+
+    def _remove_container(self, name: str) -> None:
+        """Force-remove the named container after a parent-side timeout."""
+        try:
+            subprocess.run(
+                [self.docker, "rm", "-f", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 @dataclass
 class _Completed:
     stdout: str
@@ -352,18 +537,15 @@ def make_backend(name: str) -> Backend:
     ``"subprocess"``, and the difference is visible in the result. The experiment's
     conclusions depend on that field not lying.
 
-    ``DockerBackend`` arrives in Phase 8. Until then asking for it lands on the same
-    honest fallback path a missing daemon would, which is the behaviour the invariant
-    demands anyway.
+    Availability means the CLI can reach a live daemon. A missing CLI, a stopped Docker
+    Desktop, or a probe timeout all select ``SubprocessBackend`` before any submission is
+    accepted, so the verdict's backend field remains truthful.
     """
     if name == "subprocess":
         return SubprocessBackend()
 
     if name == "docker":
-        docker_backend = globals().get("DockerBackend")
-        if docker_backend is None:
-            return SubprocessBackend()
-        backend = docker_backend()
+        backend = DockerBackend()
         ok, _reason = backend.available()
         return backend if ok else SubprocessBackend()
 
