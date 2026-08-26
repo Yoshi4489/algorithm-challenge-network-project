@@ -335,7 +335,7 @@ MAX_SUBARRAY = Problem(
     time_sizes=(1000, 2000, 4000, 8000, 16000, 32000),
     ops_sizes=(500, 1000, 2000, 4000),
     space_sizes=(1000, 2000, 4000, 8000),
-    size_cap=262144,
+    size_cap=2097152,
 )
 
 
@@ -374,7 +374,7 @@ TWO_SUM_SORTED = Problem(
     time_sizes=(1000, 2000, 4000, 8000, 16000, 32000),
     ops_sizes=(500, 1000, 2000, 4000),
     space_sizes=(1000, 2000, 4000, 8000),
-    size_cap=262144,
+    size_cap=2097152,
 )
 
 
@@ -412,7 +412,7 @@ HAS_DUPLICATE = Problem(
     time_sizes=(1000, 2000, 4000, 8000, 16000, 32000),
     ops_sizes=(500, 1000, 2000, 4000),
     space_sizes=(1000, 2000, 4000, 8000),
-    size_cap=262144,
+    size_cap=2097152,
     size_note=(
         "Generated input contains no duplicates and is shuffled: the worst case for "
         "both the set solution and the sort solution."
@@ -452,8 +452,14 @@ FIB = Problem(
     generate=_gen_fib,
     # n is a value, not a length, so the declared ladder is tiny. Each +2 steps multiplies
     # the naive recursion's work by phi**2 ~ 2.6, giving a ~120x span across the ladder —
-    # plenty of dynamic range to separate exponential from polynomial.
-    time_sizes=(18, 20, 22, 24, 26, 28),
+    # plenty of dynamic range to separate exponential from polynomial. The ladder starts in
+    # the low twenties on purpose: the naive solution's smallest sizes finish below the 5 ms
+    # timing floor, and if fewer than four rungs cleared it the measurement loop would widen
+    # the ladder upward — into a naive fib(56) that runs for hours and is only stopped by the
+    # parent's wall-clock kill, turning the headline 606 into a spurious 602. Starting at 22
+    # keeps enough measurable rungs (roughly n=24 and up) that the exponential is fitted at
+    # its declared sizes and the ladder never has to widen.
+    time_sizes=(22, 24, 26, 28, 30, 32),
     ops_sizes=(12, 14, 16, 18),
     space_sizes=(12, 14, 16, 18),
     # An O(n) solution finishes n=28 in microseconds, far below the timer's noise floor, so

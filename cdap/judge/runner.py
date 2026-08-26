@@ -52,6 +52,7 @@ reach the same verdict.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 import tracemalloc
@@ -77,6 +78,64 @@ MIN_FIT_POINTS = 4
 #: applies to a correctness run; this one stops a ladder from walking off a cliff — an
 #: exponential solution at the next size up could run for hours.
 MAX_LADDER_CALL_S = 8.0
+
+#: A call taking longer than this is measured **once** instead of TIME_REPEATS times.
+#:
+#: Repeats exist to beat timer noise, and noise is a fixed number of microseconds. Against
+#: a call of a few milliseconds that matters; against a call of half a second it is a
+#: rounding error, and paying five times over for it costs the ladder the larger sizes that
+#: actually reveal the growth rate. Precision at one size is worth less than reach across
+#: sizes — reach is the entire measurement.
+LONG_CALL_S = 0.5
+
+#: Per-phase ceilings for the three measurement passes, and their total.
+#:
+#: All three need one, and originally only the timing ladder had one — which is what made
+#: an O(n^2) submission come back ``602 TIME_LIMIT_EXCEEDED`` instead of ``606``. The
+#: timing ladder stopped politely at its own budget, then Method B started with no budget
+#: at all and ran until the *parent* killed the child. A killed child reports no result, so
+#: the ten passing tests and the complete Method A measurements were both thrown away, and
+#: the headline verdict of the whole project was replaced by a timeout.
+#:
+#: Method B gets less wall-clock than Method A despite measuring fewer sizes, because
+#: opcode counting costs roughly 31x (Phase 1 measured it). It is a second opinion and
+#: never the decider, so truncating it early costs evidence, not correctness — and the
+#: truncation is recorded in ``notes`` rather than passed off as a complete measurement.
+MAX_TIME_LADDER_S = 20.0
+MAX_OPS_LADDER_S = 10.0
+MAX_SPACE_LADDER_S = 8.0
+MAX_MEASURE_TOTAL_S = MAX_TIME_LADDER_S + MAX_OPS_LADDER_S + MAX_SPACE_LADDER_S
+
+#: Slack between the child's own budget and the parent's kill deadline, covering the
+#: correctness tests, loading the submission, and serialising the result. The child must
+#: always finish and report on its own; the parent's kill is the backstop for a child that
+#: has stopped cooperating, not the normal way a run ends.
+CHILD_REPORT_SLACK_S = 6.0
+
+
+def run_budget_ms(contract_time_limit_ms: int) -> int:
+    """Wall-clock budget for one whole judging run — tests *and* the measurement ladder.
+
+    This exists because two very different limits were being spelled with the same number,
+    and the confusion has a visible cost.
+
+    ``contract.time_limit_ms`` is a limit on **one call**: exceed it and the verdict is
+    602 TIME_LIMIT_EXCEEDED. It is a promise to the player about their own solution.
+
+    A judging run is a different thing entirely. It runs the correctness tests, then walks
+    a ladder that deliberately calls the solution at sizes far *beyond* anything the tests
+    use — that is the whole point of measuring growth. A correct O(n^2) solution therefore
+    spends far longer being profiled than any single call is allowed to take, and it is
+    supposed to.
+
+    Handing ``time_limit_ms`` to a backend as the process budget kills the child partway
+    up the ladder, and a killed child reports 602 — so the solution that the 606 verdict
+    exists to catch would be rejected for the wrong reason, with the wrong code. Callers
+    use this function instead, and the child's own per-phase budgets keep the number honest
+    from the inside: the total below is strictly larger than everything the child will
+    spend, so in normal operation the parent's deadline is never the thing that ends a run.
+    """
+    return int(contract_time_limit_ms + (MAX_MEASURE_TOTAL_S + CHILD_REPORT_SLACK_S) * 1000)
 
 
 class Timeout(Exception):
@@ -222,17 +281,67 @@ def measure_time(function, generate, sizes, size_cap) -> dict:
     samples: Dict[int, float] = {}
     ladder = list(sizes)
     notes: List[str] = []
+    ladder_started = time.perf_counter()
 
     index = 0
     while index < len(ladder):
         n = ladder[index]
+        spent = time.perf_counter() - ladder_started
+        remaining = MAX_TIME_LADDER_S - spent
+        if remaining <= 0:
+            # Out of aggregate budget. Stop with what we have rather than letting the
+            # parent's wall-clock kill decide, because a killed child reports 602 and
+            # loses every point already measured. Stopping here keeps the points and
+            # lets the profiler judge on them, or say 611 if there are too few.
+            notes.append(
+                f"stopped before n={n}: the {MAX_TIME_LADDER_S:.0f}s ladder budget is spent"
+            )
+            break
+
+        # Look before leaping. Reaching this size may cost far more than the budget has
+        # left, and finding that out by running it is the expensive way: the call would be
+        # cut off by the parent's kill, taking every measurement already banked with it.
+        #
+        # This is what the O(n^2) demo needs. max-subarray's ladder climbs to n=32768, and
+        # a quadratic solution there is ~10^9 interpreted operations — over a minute, at
+        # any budget worth waiting for. But its growth is already unmistakable by n=8192,
+        # and the extra rung would add confidence, not information. So predict the cost and
+        # decline politely, rather than being killed and reporting a timeout.
+        predicted = _predict_next_seconds(samples, n)
+        if predicted is not None:
+            # Two separate reasons a rung is unaffordable, and both are worth naming in the
+            # notes because the report quotes them:
+            #   * it does not fit in the budget the ladder has left, or
+            #   * it exceeds the per-call ceiling, so _time_one_size would raise Timeout
+            #     after paying the full cost. Predicting it saves that entire call — in the
+            #     O(n^2) demo, about thirteen seconds spent to learn what the previous two
+            #     measurements already implied.
+            unaffordable = predicted > remaining or predicted > MAX_LADDER_CALL_S
+            usable_now = sum(1 for s in samples.values() if s >= MIN_MEASURABLE_S)
+            if unaffordable and usable_now >= MIN_FIT_POINTS:
+                limit = "the per-call ceiling" if predicted > MAX_LADDER_CALL_S else "the budget left"
+                notes.append(
+                    f"stopped before n={n}: projected ~{predicted:.1f}s from the observed "
+                    f"growth, over {limit} ({min(remaining, MAX_LADDER_CALL_S):.1f}s), with "
+                    f"{usable_now} points already usable"
+                )
+                break
+            if unaffordable:
+                # Too few points to fit yet, so the rung is worth attempting even though it
+                # looks unaffordable: stopping now guarantees 611, while trying might still
+                # land a measurement. _time_one_size enforces the real ceiling either way.
+                notes.append(
+                    f"n={n} projects ~{predicted:.1f}s, over budget, but only {usable_now} "
+                    f"of {MIN_FIT_POINTS} needed points are usable — attempting it anyway"
+                )
+
         try:
-            samples[n] = _time_one_size(function, generate, n)
-        except Timeout:
+            samples[n] = _time_one_size(function, generate, n, remaining)
+        except Timeout as exc:
             # The solution is slow enough that the next size would be worse. Stop here:
             # the points already collected are what reveal the growth, and an exponential
             # solution reaching this branch is exactly the case we want to catch.
-            notes.append(f"stopped at n={n}: a single call exceeded {MAX_LADDER_CALL_S}s")
+            notes.append(f"stopped at n={n}: {exc}")
             break
 
         index += 1
@@ -280,26 +389,94 @@ def measure_time(function, generate, sizes, size_cap) -> dict:
     }
 
 
-def _time_one_size(function, generate, n: int) -> float:
-    """Minimum of ``TIME_REPEATS`` timed calls at size ``n``, after one warm-up.
+def _predict_next_seconds(samples: Dict[int, float], next_n: int) -> Optional[float]:
+    """Estimate what a call at ``next_n`` will cost, from the two largest measurements.
+
+    Deliberately the simplest thing that works, because it is presented on video: assume
+    cost behaves like ``t = c * n**p`` between neighbouring sizes, read the exponent ``p``
+    off the last two points, and extrapolate one rung.
+
+    Taking logs of ``t2/t1 = (n2/n1)**p`` gives ``p = log(t2/t1) / log(n2/n1)`` — no
+    regression and no numpy, just one division. The same log-log slope idea the profiler
+    fits properly across every point; here only the local slope matters, since the question
+    is about the very next rung and recent points are the ones that resemble it.
+
+    Two points is enough on purpose. It is a *scheduling* decision — is this affordable? —
+    not a verdict, so being roughly right in time to act beats being precisely right too
+    late. Returns None when there is not enough to go on, meaning "no prediction, just try
+    it": with fewer than two measurements, or a point too small to divide by safely, a
+    guess would be noise dressed as arithmetic.
+    """
+    if len(samples) < 2:
+        return None
+
+    sizes = sorted(samples)
+    n1, n2 = sizes[-2], sizes[-1]
+    t1, t2 = samples[n1], samples[n2]
+
+    # Guard every division. A sub-millisecond t1 makes the ratio meaningless, and equal
+    # sizes would divide by log(1) = 0.
+    if n2 <= n1 or next_n <= n2 or t1 < MIN_MEASURABLE_S or t2 <= 0.0:
+        return None
+
+    exponent = math.log(t2 / t1) / math.log(n2 / n1)
+    # Clamp below at linear. A measurement pair can come out flatter than reality through
+    # noise or a warm cache, and under-predicting is the dangerous direction — it is what
+    # lets the ladder attempt a rung that then gets the child killed. Nothing here runs
+    # faster than linear in n for large n, so linear is a safe floor.
+    exponent = max(1.0, exponent)
+    return t2 * (next_n / n2) ** exponent
+
+
+def _time_one_size(function, generate, n: int, budget_s: float = MAX_TIME_LADDER_S) -> float:
+    """Minimum of up to ``TIME_REPEATS`` timed calls at size ``n``, after one warm-up.
 
     The input is regenerated before every call, outside the timed region, so a solution
     that mutates its argument cannot make its own later runs cheaper.
-    """
-    args = generate(n)
-    function(*args)                       # warm-up, discarded
 
+    Two things cut the repeats short, and both trade precision for reach:
+
+    * A call slower than ``LONG_CALL_S`` is measured once. Repeats fight timer noise, which
+      is a fixed few microseconds — irrelevant next to a half-second call, and five of them
+      would cost the ladder a whole rung it could have measured instead.
+    * ``budget_s`` — what the ladder has left in total — stops the loop after three runs.
+      The minimum of three is still a sound estimator, because timing noise is one-sided:
+      more repeats can only lower the minimum, never raise it.
+    """
+    # The warm-up is timed too, and against the per-call ceiling. It used to be untimed,
+    # which left a hole: a solution whose *first* call never returns would sit here past
+    # every limit this function has, until the parent killed the whole child.
+    args = generate(n)
+    warmup_started = time.perf_counter()
+    function(*args)                       # warm-up, discarded
+    warmup_s = time.perf_counter() - warmup_started
+    if warmup_s > MAX_LADDER_CALL_S:
+        raise Timeout(f"warm-up call at n={n} took {warmup_s:.1f}s, over the "
+                      f"{MAX_LADDER_CALL_S:.0f}s per-call ceiling")
+
+    # The warm-up already measured this size once, so it also answers whether repeating is
+    # worth anything. A slow call is its own best estimate.
+    if warmup_s >= LONG_CALL_S:
+        return warmup_s
+
+    started = time.perf_counter()
     best = None
-    for _ in range(TIME_REPEATS):
+    for repeat in range(TIME_REPEATS):
         args = generate(n)                # rebuilt so every run sees identical input
         start = time.perf_counter()
         function(*args)
         elapsed = time.perf_counter() - start
 
         if elapsed > MAX_LADDER_CALL_S:
-            raise Timeout(f"call at n={n} took {elapsed:.1f}s")
+            raise Timeout(f"call at n={n} took {elapsed:.1f}s, over the "
+                          f"{MAX_LADDER_CALL_S:.0f}s per-call ceiling")
         if best is None or elapsed < best:
             best = elapsed
+
+        # Enough for an estimate, and the budget is gone — bank it and let the ladder
+        # move on to a larger n while it still can.
+        if repeat >= 2 and (time.perf_counter() - started) + warmup_s >= budget_s:
+            break
 
     return best
 
@@ -341,10 +518,33 @@ def measure_ops(function, generate, sizes, counter_name: str) -> dict:
 
     samples: Dict[int, int] = {}
     notes: List[str] = []
+    started = time.perf_counter()
     for n in sizes:
+        # Method B needs a budget of its own, and the reason is the bug this fixed. The
+        # timing ladder used to be the only bounded pass, so an O(n^2) submission stopped
+        # politely at its own limit and then came here — where counting every opcode at
+        # ~31x overhead ran until the *parent* killed the child. A killed child reports no
+        # result at all, so ten passing tests and a complete Method A measurement were
+        # both discarded and the run came back 602 instead of the 606 it had already
+        # earned. A second opinion must never be able to destroy the first one.
+        spent = time.perf_counter() - started
+        if spent >= MAX_OPS_LADDER_S:
+            notes.append(
+                f"stopped before n={n}: the {MAX_OPS_LADDER_S:.0f}s opcode-counting budget "
+                f"is spent (Method B is a second opinion; Method A decides)"
+            )
+            break
+
         args = generate(n)
         try:
-            samples[n] = counter(function, *args)
+            # Both counters return ``(result, opcodes)``: the value the function produced
+            # *and* the count. The result is deliberately dropped here — correctness was
+            # settled by run_tests above, and Method B's job is only to count. Unpacking
+            # rather than storing the pair matters: ``samples`` is fitted as numbers, and a
+            # tuple in it fails much later, in the zero-count guard below, as a mystifying
+            # "'>' not supported between instances of 'tuple' and 'int'".
+            _result, opcodes = counter(function, *args)
+            samples[n] = opcodes
         except Exception as exc:                     # noqa: BLE001
             notes.append(f"counting failed at n={n}: {type(exc).__name__}: {exc}")
             break
@@ -400,8 +600,21 @@ def measure_space(function, generate, sizes) -> dict:
 
     samples: Dict[int, float] = {}
     notes: List[str] = []
+    started = time.perf_counter()
 
     for n in sizes:
+        # Bounded for the same reason as Method B, and more so: tracemalloc records every
+        # allocation the interpreter makes, which is slow, and this is the last pass before
+        # the result is written. Overrunning here would throw away all three measurements
+        # at the moment they were about to be reported.
+        spent = time.perf_counter() - started
+        if spent >= MAX_SPACE_LADDER_S:
+            notes.append(
+                f"stopped before n={n}: the {MAX_SPACE_LADDER_S:.0f}s space-measurement "
+                f"budget is spent"
+            )
+            break
+
         args = generate(n)                # built BEFORE tracing starts being measured
         tracemalloc.start()
         try:
