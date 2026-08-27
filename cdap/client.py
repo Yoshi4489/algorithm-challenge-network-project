@@ -39,11 +39,12 @@ is the reader thread, which is now blocked waiting for itself. A deadlock, arriv
 writing the obvious thing. So the reader never sends anything that needs an answer: it
 queues the work and goes straight back to reading.
 
-Printing, which is a graded requirement rather than a debugging aid
-------------------------------------------------------------------
-Every frame sent and received is printed with its status code **and phrase**, on both
-sides. That happens inside ``protocol.Connection``, so it cannot be forgotten here, and it
-is never gated behind ``-v`` — ``-v`` only adds full headers and body previews.
+Printing and compact play
+-------------------------
+The server always prints every frame. The client defaults to a compact player view, because
+printing three UDP snapshots every quarter second hides the information a player needs.
+``--wire`` restores the complete client transcript (with code and phrase); ``-v`` adds full
+headers and bodies to that transcript.
 """
 
 from __future__ import annotations
@@ -88,6 +89,190 @@ WRONG_VERSION = "CDAP/9.9"
 TERMINAL_EVENTS = ("MATCH_END", "SERVER_SHUTDOWN")
 
 
+class PlayerView:
+    """A quiet, persistent player-facing view over CDAP's noisy display feed.
+
+    UDP is intentionally frequent so a lossy receiver quickly converges on current state.
+    Printing every snapshot is useful for a protocol demonstration but unusable while a
+    person is trying to play.  This class keeps the protocol unchanged and turns the feed
+    into notices that matter to a player.
+    """
+
+    _MILESTONES_MS = (120_000, 60_000, 30_000, 10_000, 5_000, 4_000, 3_000, 2_000, 1_000)
+
+    def __init__(self, *, compact: bool = True):
+        self.compact = compact
+        self._lock = threading.Lock()
+        self._countdown_stop: Optional[threading.Event] = None
+        self._countdown_thread: Optional[threading.Thread] = None
+        self._last_remaining: Dict[str, int] = {}
+        self._announced_milestones: Dict[str, set[int]] = {}
+        self._scores: Dict[str, Dict[str, tuple[int, int, int]]] = {}
+
+    def close(self) -> None:
+        self.stop_countdown()
+
+    def _print(self, text: str = "") -> None:
+        with self._lock:
+            print(text, flush=True)
+
+    def banner(self, title: str, *lines: str) -> None:
+        self._print()
+        self._print(f"  ===== {title} =====")
+        for line in lines:
+            self._print(f"  {line}")
+        self._print()
+
+    def match_found(self, headers) -> None:
+        match = headers.get("Match", "?")
+        opponents = headers.get("Opponents") or headers.get("Detail", "opponent unknown")
+        self.banner("MATCH FOUND", f"match      : {match}", f"opponents  : {opponents}")
+        try:
+            start_in_ms = max(0, int(headers.get("Start-In-Ms", "0")))
+        except (TypeError, ValueError):
+            start_in_ms = 0
+        if start_in_ms:
+            self.start_countdown(start_in_ms)
+
+    def start_countdown(self, start_in_ms: int) -> None:
+        self.stop_countdown()
+        stop = threading.Event()
+        self._countdown_stop = stop
+        seconds = max(1, (start_in_ms + 999) // 1000)
+
+        def run() -> None:
+            for remaining in range(seconds, 0, -1):
+                self._print(f"  Match begins in {remaining}..." )
+                if stop.wait(1.0):
+                    return
+
+        self._countdown_thread = threading.Thread(target=run, name="match-countdown",
+                                                  daemon=True)
+        self._countdown_thread.start()
+
+    def stop_countdown(self) -> None:
+        if self._countdown_stop is not None:
+            self._countdown_stop.set()
+        thread = self._countdown_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
+        self._countdown_stop = None
+        self._countdown_thread = None
+
+    def match_start(self, headers) -> None:
+        self.stop_countdown()
+        duration = self._format_ms(headers.get("Duration-Ms"))
+        self.banner(
+            "MATCH START",
+            f"match      : {headers.get('Match', '?')}",
+            f"problem    : {headers.get('Problem', headers.get('Detail', '?'))}",
+            f"clock      : {duration}",
+            f"contract   : time {headers.get('Required-Time', '?')}, "
+            f"space {headers.get('Required-Space', '?')}",
+        )
+
+    def terminal(self, name: str, headers) -> None:
+        self.stop_countdown()
+        self.banner(name, headers.get("Detail", ""))
+
+    def warning(self, text: str) -> None:
+        self._print(f"  ! UDP warning: {text}")
+
+    @staticmethod
+    def _format_ms(value) -> str:
+        try:
+            seconds = max(0, (int(value) + 999) // 1000)
+        except (TypeError, ValueError):
+            return "?"
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def udp_update(self, kind: str, fields: dict) -> None:
+        """Render changed state and time milestones; ignore unchanged snapshots."""
+        match = fields.get("match")
+        if not match:
+            return
+        if kind == "CLOCK":
+            try:
+                remaining = max(0, int(fields["remain"]))
+            except (KeyError, TypeError, ValueError):
+                self._print("  ! UDP CLOCK ignored: invalid remaining time")
+                return
+            previous = self._last_remaining.get(match)
+            self._last_remaining[match] = remaining
+            if previous is None:
+                self._print(f"  Time remaining: {self._format_ms(remaining)}")
+                return
+            seen = self._announced_milestones.setdefault(match, set())
+            for milestone in self._MILESTONES_MS:
+                if milestone not in seen and previous > milestone >= remaining:
+                    seen.add(milestone)
+                    self._print(f"  Time remaining: {self._format_ms(remaining)}")
+                    break
+            return
+
+        if kind == "TICK":
+            player = fields.get("player", "?")
+            try:
+                score = (int(fields.get("passed", 0)), int(fields.get("total", 0)),
+                         int(fields.get("subs", 0)))
+            except (TypeError, ValueError):
+                self._print("  ! UDP TICK ignored: invalid score")
+                return
+            self._update_score(match, player, score)
+            return
+
+        if kind == "BOARD":
+            for entry in str(fields.get("e", "")).split(","):
+                player, separator, value = entry.partition(":")
+                if not separator:
+                    continue
+                pieces = value.split(":")
+                if len(pieces) != 2:
+                    continue
+                try:
+                    self._update_score(match, player, (int(pieces[0]), 0, int(pieces[1])))
+                except ValueError:
+                    continue
+
+    def _update_score(self, match: str, player: str, score: tuple[int, int, int]) -> None:
+        scores = self._scores.setdefault(match, {})
+        previous = scores.get(player)
+        if previous == score:
+            return
+        # BOARD has no test-total field. Preserve it from the richer TICK snapshot.
+        if score[1] == 0 and previous is not None:
+            score = (score[0], previous[1], score[2])
+        if previous == score:
+            return
+        scores[player] = score
+        total = f"/{score[1]}" if score[1] else ""
+        self._print(f"  Score update: {player} {score[0]}{total}, "
+                    f"{score[2]} submission{'s' if score[2] != 1 else ''}")
+
+    def show_problem(self, response: Message) -> None:
+        try:
+            problem = json.loads(response.text())
+        except ValueError:
+            return
+        if not isinstance(problem, dict):
+            return
+        contract = problem.get("contract") or {}
+        self.banner(
+            "PROBLEM",
+            f"{problem.get('title', '?')} [{problem.get('id', '?')}]",
+            f"entry      : {problem.get('signature', problem.get('entry', '?'))}",
+            f"contract   : time {contract.get('required_time', '?')}, "
+            f"space {contract.get('required_space', '?')}",
+            f"remaining  : {self._format_ms(response.headers.get('Time-Remaining-Ms'))}",
+        )
+        for paragraph in str(problem.get("statement", "")).strip().splitlines():
+            self._print(f"    {paragraph}")
+        for sample in problem.get("samples") or []:
+            self._print(f"    in  {sample.get('in')!r}")
+            self._print(f"    out {sample.get('out')!r}")
+        self._print("\n  Next: submit <file.py>\n")
+
+
 class ClientError(Exception):
     """The connection is gone, or the server said something the client cannot use."""
 
@@ -96,12 +281,16 @@ class UdpFeed:
     """Display-only UDP receiver: attach, drop stale/lost values, render the newest state."""
 
     def __init__(self, host: str, port: int, token: str, log: WireLog,
-                 loss_probability: float = 0.0):
+                 loss_probability: float = 0.0,
+                 on_update: Optional[Callable[[str, dict], None]] = None,
+                 on_warning: Optional[Callable[[str], None]] = None):
         self.host = host
         self.port = port
         self.token = token
         self.log = log
         self.loss_probability = loss_probability
+        self.on_update = on_update
+        self.on_warning = on_warning
         self.latest = LatestWins()
         self.closed = False
         self.sock: Optional[socket.socket] = None
@@ -147,11 +336,15 @@ class UdpFeed:
                     raise ProtocolError(f"UDP feed requires {PROTOCOL_VERSION}")
                 kind, fields = decode_datagram(data)
             except (ProtocolError, FrameTooLarge) as exc:
-                self.log.udp_dropped(f"malformed datagram from {peer}: {exc}")
+                reason = f"malformed datagram from {peer}: {exc}"
+                self.log.udp_dropped(reason)
+                self._warn(reason)
                 continue
 
             if kind not in {"TICK", "CLOCK", "BOARD"}:
-                self.log.udp_dropped(f"unexpected {kind} from {peer}")
+                reason = f"unexpected {kind} from {peer}"
+                self.log.udp_dropped(reason)
+                self._warn(reason)
                 continue
 
             if self.loss_probability and random.random() < self.loss_probability:
@@ -165,16 +358,28 @@ class UdpFeed:
             try:
                 seq = int(fields["seq"])
             except (KeyError, TypeError, ValueError):
-                self.log.udp_dropped(f"{kind} from {peer}: missing numeric seq")
+                reason = f"{kind} from {peer}: missing numeric seq"
+                self.log.udp_dropped(reason)
+                self._warn(reason)
                 continue
             if not match_id:
-                self.log.udp_dropped(f"{kind} from {peer}: missing match")
+                reason = f"{kind} from {peer}: missing match"
+                self.log.udp_dropped(reason)
+                self._warn(reason)
                 continue
             if not self.latest.accept(match_id, seq):
                 highest = self.latest.highest(match_id)
-                self.log.udp_dropped(f"stale or excessive seq={seq}, highest={highest}, dropped")
+                reason = f"stale or excessive seq={seq}, highest={highest}, dropped"
+                self.log.udp_dropped(reason)
+                self._warn(reason)
                 continue
             self.log.udp_received(kind, fields, peer=peer)
+            if self.on_update is not None:
+                self.on_update(kind, fields)
+
+    def _warn(self, reason: str) -> None:
+        if self.on_warning is not None:
+            self.on_warning(reason)
 
 
 class _Pending:
@@ -199,7 +404,8 @@ class CdapClient:
 
     def __init__(self, host: str, port: int, log: WireLog, *,
                  bad_version: bool = False, tamper: bool = False,
-                 lang: str = "python", auto_submit: Optional[str] = None):
+                 lang: str = "python", auto_submit: Optional[str] = None,
+                 view: Optional[PlayerView] = None):
         self.host = host
         self.port = port
         self.log = log
@@ -208,6 +414,7 @@ class CdapClient:
         self.lang = lang
         #: File to submit when MATCH_START arrives, or None. Consumed once per match.
         self.auto_submit = auto_submit
+        self.view = view or PlayerView()
 
         self.conn: Optional[Connection] = None
         self.closed = False
@@ -234,6 +441,7 @@ class CdapClient:
         self.last_submission: Optional[str] = None
 
         self.in_match = False
+        self.queued = False
         self.verdicts: List[dict] = []
         self._threads: List[threading.Thread] = []
 
@@ -264,6 +472,7 @@ class CdapClient:
     def close(self) -> None:
         """Close the socket and wake anything still waiting."""
         self.closed = True
+        self.view.close()
         self._actions.put(None)
         self._fail_pending("the connection was closed")
         if self.conn is not None:
@@ -429,13 +638,17 @@ class CdapClient:
         if name == "MATCH_FOUND":
             self.match_id = headers.get("Match")
             self.room_code = None
+            self.queued = False
+            self.view.match_found(headers)
         elif name == "MATCH_START":
             self.match_id = headers.get("Match") or self.match_id
             self.in_match = True
-            self._on_match_start()
+            self.view.match_start(headers)
+            self._on_match_start(headers)
         elif name == "MATCH_END":
             self.in_match = False
             self.match_id = None
+            self.queued = False
         elif name == "VERDICT":
             self._on_verdict(message)
         elif name == "ROOM_UPDATE":
@@ -444,13 +657,20 @@ class CdapClient:
         if name in TERMINAL_EVENTS:
             self._on_terminal(name, headers)
 
-    def _on_match_start(self) -> None:
-        """Queue the auto-submit, if the player asked for one."""
-        if self.auto_submit is None:
-            return
+    def _on_match_start(self, headers) -> None:
+        """Fetch the newly revealed problem, then optionally submit a scripted file."""
         path = self.auto_submit
         self.auto_submit = None         # once per match, not once per event
-        self._actions.put(lambda: self._auto_submit(path))
+        self._actions.put(lambda: self._fetch_problem_then_submit(path))
+
+    def _fetch_problem_then_submit(self, path: Optional[str]) -> None:
+        problem = self.request("GET_PROBLEM")
+        if is_success(problem.status):
+            self.view.show_problem(problem)
+        if path is not None:
+            self.log.note(f"auto-submitting {path} for "
+                          f"{problem.headers.get('Problem', '?')}")
+            self.submit_file(path)
 
     def _on_verdict(self, message: Message) -> None:
         """Render a verdict. The one place the 6xx namespace is displayed to a human.
@@ -517,10 +737,7 @@ class CdapClient:
         print()
 
     def _on_terminal(self, name: str, headers) -> None:
-        detail = headers.get("Detail", "")
-        print()
-        print(f"  ===== {name} =====  {detail}")
-        print()
+        self.view.terminal(name, headers)
 
     def _agent_loop(self) -> None:
         """Run the follow-up requests events asked for, one at a time."""
@@ -604,11 +821,7 @@ class CdapClient:
         would do, it proves the request works, and it puts the contract the submission is
         about to be judged against into the log immediately above the submission itself.
         """
-        problem = self.request("GET_PROBLEM")
-        if is_success(problem.status):
-            self.log.note(f"auto-submitting {path} for "
-                          f"{problem.headers.get('Problem', '?')}")
-        self.submit_file(path)
+        self._fetch_problem_then_submit(path)
 
     @staticmethod
     def _why(response: Message) -> str:
@@ -655,10 +868,10 @@ class CommandLoop:
         self.log = log
 
     def run(self) -> None:
-        print(HELP_TEXT)
+        print("\n  Next: type queue to find a match. Type help for all commands.\n")
         while not self.client.closed:
             try:
-                line = input(f"{self.client.user or 'cdap'}> ").strip()
+                line = input(f"{self.client.user or 'cdap'}[{self._state_label()}]> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 self._quit()
@@ -696,10 +909,16 @@ class CommandLoop:
         print(HELP_TEXT)
 
     def _cmd_queue(self, args: List[str]) -> None:
-        self._show(self.client.request("QUEUE"))
+        response = self.client.request("QUEUE")
+        if is_success(response.status):
+            self.client.queued = True
+        self._show(response)
 
     def _cmd_dequeue(self, args: List[str]) -> None:
-        self._show(self.client.request("DEQUEUE"))
+        response = self.client.request("DEQUEUE")
+        if is_success(response.status):
+            self.client.queued = False
+        self._show(response)
 
     def _cmd_room(self, args: List[str]) -> None:
         payload = {"problem": args[0]} if args else {}
@@ -730,7 +949,7 @@ class CommandLoop:
     def _cmd_problem(self, args: List[str]) -> None:
         response = self.client.request("GET_PROBLEM")
         if is_success(response.status):
-            self._print_problem(response)
+            self.client.view.show_problem(response)
         self._show(response)
 
     def _cmd_submit(self, args: List[str]) -> None:
@@ -779,6 +998,17 @@ class CommandLoop:
         print(f"  token={client.token or '-'}  (Phase 7: this is what UDP_ATTACH will use)")
 
     # -- output ------------------------------------------------------------
+
+    def _state_label(self) -> str:
+        if self.client.in_match:
+            return f"match {self.client.match_id or '?'}"
+        if self.client.match_id:
+            return "starting"
+        if self.client.queued:
+            return "queued"
+        if self.client.room_code:
+            return f"room {self.client.room_code}"
+        return "idle"
 
     def _show(self, response: Message) -> None:
         """Print the code, the phrase, and the detail. Never a bare number."""
@@ -864,10 +1094,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="drop this fraction of received datagrams, to show the feed "
                            "converging under loss")
 
+    parser.add_argument("--wire", action="store_true",
+                        help="show every TCP frame and UDP datagram for protocol demos "
+                             "and debugging (normal play is compact)")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="add full headers and body previews to the wire log. The "
-                             "baseline log is NOT gated behind this — printing every "
-                             "message with its status code and phrase is a requirement")
+                        help="add full headers and body previews to the wire log; this also "
+                             "enables the full frame transcript")
     return parser
 
 
@@ -878,7 +1110,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     capabilities.enable_utf8_output()
 
     args = build_parser().parse_args(argv)
-    log = WireLog(stream=sys.stdout, verbose=args.verbose, prefix="")
+    wire_mode = args.wire or args.verbose or args.feed_only
+    log = WireLog(stream=sys.stdout, verbose=args.verbose, prefix="", wire=wire_mode)
 
     if not 0.0 <= args.udp_loss <= 1.0:
         log.note("--udp-loss must be between 0.0 and 1.0")
@@ -892,11 +1125,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.note("--no-udp: TCP only. Nothing in a match depends on the feed "
                  "(design invariant 1), so this changes the display and nothing else.")
 
+    view = PlayerView(compact=not wire_mode)
     client = CdapClient(args.host, args.port, log,
                         bad_version=args.bad_version,
                         tamper=args.tamper,
                         lang=args.lang,
-                        auto_submit=args.submit)
+                        auto_submit=args.submit,
+                        view=view)
     feed: Optional[UdpFeed] = None
 
     try:
@@ -925,7 +1160,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             try:
                 feed = UdpFeed(args.host, args.udp_port, client.token, log,
-                               loss_probability=args.udp_loss)
+                               loss_probability=args.udp_loss,
+                               on_update=None if wire_mode else view.udp_update,
+                               on_warning=None if wire_mode else view.warning)
                 feed.start()
                 log.note(f"UDP feed attached on port {args.udp_port}; it carries display "
                          "data only")

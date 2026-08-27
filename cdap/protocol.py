@@ -668,8 +668,9 @@ class WireLog:
     This class *is* deliverable 2's "print the messages and the status (status code,
     status phrase) they send and receive" requirement, so two rules hold:
 
-    * It is never gated behind a verbosity flag. ``verbose=True`` adds more detail
-      — full bodies, every header — but the baseline log always prints.
+    * ``wire=True`` prints the complete transcript. ``verbose=True`` adds full bodies
+      and every header. Compact player clients set ``wire=False`` but retain lifecycle
+      notes and their human-facing match view.
     * A status never appears as a bare number. Everything goes through
       ``format_status`` so the phrase always travels with the code.
 
@@ -685,10 +686,15 @@ class WireLog:
     server -> client, so the direction carries no information.
     """
 
-    def __init__(self, stream=None, verbose=False, prefix="", use_unicode=None):
+    def __init__(self, stream=None, verbose=False, prefix="", use_unicode=None,
+                 wire=True):
         self._stream = stream if stream is not None else sys.stdout
         self.verbose = verbose
         self.prefix = prefix
+        # A player normally needs game information, not an unbounded packet trace.  The
+        # arena and ``--wire`` clients leave this enabled; compact clients still use this
+        # logger for lifecycle notes and warnings.
+        self.wire = wire
         if use_unicode is None:
             capabilities.enable_utf8_output()
             use_unicode = capabilities.console_unicode_ok()
@@ -706,6 +712,8 @@ class WireLog:
         self._log_message("TCP", self.markers.received, message, peer)
 
     def _log_message(self, transport, marker, message, peer=""):
+        if not self.wire:
+            return
         if message.kind is Kind.EVENT:
             tag = "[EVENT]"
         else:
@@ -749,9 +757,13 @@ class WireLog:
     # -- UDP ---------------------------------------------------------------
 
     def udp_sent(self, kind, fields, peer=""):
+        if not self.wire:
+            return
         self._emit(f"[UDP {self.markers.sent}] {self._udp_summary(kind, fields)}{self._peer(peer)}")
 
     def udp_received(self, kind, fields, peer=""):
+        if not self.wire:
+            return
         self._emit(f"[UDP {self.markers.received}] {self._udp_summary(kind, fields)}{self._peer(peer)}")
 
     def udp_dropped(self, reason):
@@ -761,7 +773,8 @@ class WireLog:
         and here is why" is precisely the behaviour the UDP design claims, and the
         video needs to show it happening.
         """
-        self._emit(f"[UDP {self.markers.dropped}] {reason}")
+        if self.wire:
+            self._emit(f"[UDP {self.markers.dropped}] {reason}")
 
     def _peer(self, peer) -> str:
         """Append the datagram's source/destination, but only under ``-v``.

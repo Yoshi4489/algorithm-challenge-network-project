@@ -847,6 +847,8 @@ class Arena:
                          if other.id != session.id]
             session.push_event("MATCH_FOUND", headers={
                 "Match": match.id,
+                "Opponents": _header_safe(", ".join(opponents) or "none (solo match)"),
+                "Start-In-Ms": max(0, int((match.starts_at - time.monotonic()) * 1000)),
                 "Detail": _header_safe(
                     f"opponent(s): {', '.join(opponents) or 'none (solo match)'}"
                 ),
@@ -1315,6 +1317,10 @@ class Arena:
             for session in self.match_sessions(match):
                 session.push_event("MATCH_START", headers={
                     "Match": match.id,
+                    "Problem": problem.id,
+                    "Duration-Ms": int(match.duration_s * 1000),
+                    "Required-Time": problem.contract.required_time,
+                    "Required-Space": problem.contract.required_space,
                     "Detail": _header_safe(
                         f"{problem.title} — required_time={problem.contract.required_time} "
                         f"required_space={problem.contract.required_space} "
@@ -2424,8 +2430,9 @@ class ArenaServer:
         self._threads: set[threading.Thread] = set()
         self._threads_lock = threading.Lock()
         self._udp_lock = threading.Lock()
-        # user -> {UDP source address -> authenticated TCP session id}. Keeping the session
-        # id lets the broadcaster discard an endpoint as soon as its attach session closes.
+        # user -> {UDP source address -> authenticated TCP session id}.  A separate
+        # feed-only login for the same user should see that user's game, while the session
+        # id still lets cleanup discard endpoints when their attach session closes.
         self._feed_endpoints: Dict[str, dict] = {}
         self._feed_seq: Dict[str, int] = {}
 
@@ -2625,7 +2632,7 @@ class ArenaServer:
                 self.log.udp_dropped(f"ATTACH from {peer}: unknown or expired session token")
                 continue
             with self._udp_lock:
-                endpoints = self._feed_endpoints.setdefault(session.id, {})
+                endpoints = self._feed_endpoints.setdefault(session.user, {})
                 endpoints.pop(address, None)
                 endpoints[address] = time.monotonic()
                 while len(endpoints) > self.max_feed_endpoints:
@@ -2638,7 +2645,7 @@ class ArenaServer:
             return
         for snapshot in self.arena.feed_snapshots(now):
             players = snapshot["players"]
-            targets = self._feed_targets(snapshot["session_ids"])
+            targets = self._feed_targets([player["user"] for player in players])
             if not targets:
                 continue
             match_id = snapshot["match"]
@@ -2667,23 +2674,29 @@ class ArenaServer:
                 "e": board,
             }, targets)
 
-    def _feed_targets(self, session_ids: List[str]) -> set:
+    def _feed_targets(self, users: List[str]) -> set:
         with self._udp_lock:
             targets = set()
-            for session_id in session_ids:
-                endpoints = self._feed_endpoints.get(session_id, {})
+            for user in users:
+                endpoints = self._feed_endpoints.get(user, {})
                 for address in list(endpoints):
-                    if self.arena.feed_session_is_alive(session_id):
+                    attached_session_id = endpoints[address]
+                    if self.arena.feed_session_is_alive(attached_session_id):
                         targets.add(address)
                     else:
                         endpoints.pop(address, None)
                 if not endpoints:
-                    self._feed_endpoints.pop(session_id, None)
+                    self._feed_endpoints.pop(user, None)
             return targets
 
     def _remove_feed_endpoints(self, session_id: str) -> None:
         with self._udp_lock:
-            self._feed_endpoints.pop(session_id, None)
+            for user, endpoints in list(self._feed_endpoints.items()):
+                for address, attached_session_id in list(endpoints.items()):
+                    if attached_session_id == session_id:
+                        endpoints.pop(address, None)
+                if not endpoints:
+                    self._feed_endpoints.pop(user, None)
 
     def _next_feed_seq(self, match_id: str) -> int:
         with self._udp_lock:

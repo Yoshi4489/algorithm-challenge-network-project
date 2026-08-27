@@ -55,7 +55,7 @@ python -m cdap.server --tcp-port 5050 --udp-port 5051 -v
 python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w1
 python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w2
 
-# Terminal 4 — player, TCP wire log
+# Terminal 4 — player, compact game view
 python -m cdap.client --host 127.0.0.1 --user alice
 
 # Terminal 5 — same player, UDP live-feed pane only
@@ -65,9 +65,10 @@ python -m cdap.client --host 127.0.0.1 --user alice --feed-only
 python -m cdap.client --host 127.0.0.1 --user bob
 ```
 
-Running the client twice for one player is deliberate: window 4 shows **only**
-request/response traffic over TCP, window 5 shows **only** UDP datagrams. Putting the two
-transports in separate panes makes the protocol split visible rather than merely claimed.
+Running the client twice for one player is deliberate: window 4 is the compact game view,
+while window 5 shows **only** raw UDP datagrams. Add `--wire` to window 4 when demonstrating
+the full TCP and UDP transcript. The server always prints every protocol message with its status
+code and phrase.
 
 Requires **Python 3.9+** (3.14 tested). No third-party packages needed. `psutil` and Docker
 are optional — see [Sandbox](#sandbox).

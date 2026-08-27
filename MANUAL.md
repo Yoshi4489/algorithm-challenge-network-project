@@ -45,25 +45,33 @@ Open a second PowerShell window in the same project directory, then run:
 py -3.14 -m cdap.client --host 127.0.0.1
 ```
 
-The client prints its available commands. Type commands at the prompt.
+The normal client uses a compact player view: important match notices stay visible, the
+countdown is shown as `3`, `2`, `1`, the problem opens automatically at match start, and UDP
+updates appear only when the timer reaches a milestone or the score changes. Type commands at
+the prompt; type `help` to see every command.
+
+For a frame-by-frame protocol transcript for the demo or debugging, add `--wire` to the client
+command. The server always prints its full wire log.
 
 ## 4. Create an account and log in
 
-Use `raw` for the two account-management requests:
+The simplest client command includes the account details. On its first connection, the client
+automatically sends `REGISTER`, then `LOGIN`; on later connections it simply logs in:
 
-```text
-raw REGISTER {"user":"alice","pass":"1234"}
-raw LOGIN {"user":"alice","pass":"1234"}
+```powershell
+py -3.14 -m cdap.client --host 127.0.0.1 --user alice --pass 1234
 ```
 
-Expected results:
+Expected wire results:
 
 - `201 REGISTERED` means the account was created.
 - `200 OK` means the login succeeded.
 - `409 USER_EXISTS` means the username is already registered; choose another name.
 - `401 AUTH_FAILED` means the username/password combination was not accepted.
 
-The client stores the login session and the UDP display token automatically.
+The client stores the login session and the UDP display token automatically. If you started a
+client without `--user` and `--pass`, close it with `quit` and start it again using the command
+above; this is easier than manually constructing account frames.
 
 ## 5. Find or create a match
 
@@ -73,8 +81,9 @@ For matchmaking, type:
 queue
 ```
 
-In solo mode, wait for `MATCH_FOUND` followed by `MATCH_START`. In two-player mode, both
-players must register, log in, and run `queue`.
+In solo mode, `MATCH_FOUND` is shown immediately, followed by a visible `3`, `2`, `1`
+countdown and `MATCH_START`. In two-player mode, both players must register, log in, and run
+`queue`.
 
 You can leave the queue before a match starts:
 
@@ -108,7 +117,7 @@ starts after its countdown.
 
 ## 6. Read the problem
 
-After `MATCH_START`, type:
+The problem opens automatically when `MATCH_START` arrives. To show it again, type:
 
 ```text
 problem
@@ -179,7 +188,7 @@ Open another terminal and start a feed-only client for the same account:
 py -3.14 -m cdap.client --host 127.0.0.1 --user alice --feed-only
 ```
 
-This window shows progress ticks, countdown clock updates, and the board. It is display-only:
+This window shows the raw progress ticks, countdown clock updates, and board. It is display-only:
 the TCP client remains authoritative for login, submissions, verdicts, and match results.
 
 To demonstrate UDP loss while keeping the game playable:
@@ -187,6 +196,9 @@ To demonstrate UDP loss while keeping the game playable:
 ```powershell
 py -3.14 -m cdap.client --host 127.0.0.1 --user alice --feed-only --udp-loss 0.4
 ```
+
+The main player client does not print every UDP datagram, so the score and match notices remain
+easy to read. Use `--wire` when you specifically want the raw TCP and UDP protocol transcript.
 
 To run the server without UDP:
 
