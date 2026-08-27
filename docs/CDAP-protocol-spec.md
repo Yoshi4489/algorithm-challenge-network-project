@@ -201,7 +201,7 @@ CDAP แยก protocol status `1xx-5xx` ออกจาก judge verdict `6xx`
 | 426 | `VERSION_UNSUPPORTED` |
 | 429 | `RATE_LIMITED`, `SUBMIT_COOLDOWN` |
 | 500 | `INTERNAL_ERROR` |
-| 503 | `JUDGE_UNAVAILABLE` |
+| 503 | `JUDGE_UNAVAILABLE`, `SERVER_BUSY` |
 
 ### 6.2 Judge Verdict
 

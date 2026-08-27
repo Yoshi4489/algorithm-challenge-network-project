@@ -616,14 +616,21 @@ class LatestWins:
     by waiting for the next tick. No ACKs, no timers, no retry queue.
     """
 
-    def __init__(self):
+    def __init__(self, *, max_streams: int = 128, max_jump: int = 1024):
         self._highest = {}
+        self._max_streams = max_streams
+        self._max_jump = max_jump
 
     def accept(self, stream, seq) -> bool:
         """True if this datagram is newer than everything seen on ``stream``."""
         last = self._highest.get(stream)
         if last is not None and seq <= last:
             return False
+        if last is not None and seq - last > self._max_jump:
+            return False
+        if last is None and len(self._highest) >= self._max_streams:
+            # Bound display-only bookkeeping. Existing streams continue normally.
+            self._highest.pop(next(iter(self._highest)))
         self._highest[stream] = seq
         return True
 

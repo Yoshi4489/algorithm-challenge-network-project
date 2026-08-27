@@ -272,7 +272,7 @@ HTTP APIs make constantly.
 | `426` | `VERSION_UNSUPPORTED` |
 | `429` | `RATE_LIMITED`, `SUBMIT_COOLDOWN` |
 | `500` | `INTERNAL_ERROR` |
-| `503` | `JUDGE_UNAVAILABLE` |
+| `503` | `JUDGE_UNAVAILABLE`, `SERVER_BUSY` |
 
 The numeric code is the machine-readable class; the phrase names the specific condition. So
 `409 ALREADY_QUEUED` and `409 ROOM_FULL` share a code with distinct phrases — the same thing
@@ -335,7 +335,17 @@ Values are percent-encoded so they stay space-free. Semantics:
 - No ACKs and no retransmission, by design.
 - The channel is unauthenticated beyond the attach token, so it carries **nothing sensitive and
   nothing state-changing** — display data only. That is a stated security boundary, not an
-  oversight.
+  oversight. Clients connect their UDP socket to the configured arena endpoint, reject
+  unexpected feed kinds, bound sequence jumps, and retain only bounded stream state.
+
+### Resource limits
+
+The server enforces process-local limits so repeated connections and historical records cannot
+grow indefinitely: `--max-sessions` (64), `--max-users` (1024), `--max-submissions` (2048),
+`--max-ended-matches` (1024), `--history-ttl` (3600 seconds), and `--max-feed-endpoints` (2 per
+session). Completed submissions and their ended matches expire after the TTL or are evicted
+oldest-first at the cap; active matches and unfinished judge jobs are retained. Capacity pressure
+returns `503 SERVER_BUSY` without partially creating an account or submission.
 
 ### State machine (per player connection)
 

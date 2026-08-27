@@ -147,6 +147,22 @@ SUPPORTED_LANGUAGES = ("python",)
 DEFAULT_WORKER_HEARTBEAT_MS = 5_000
 MISSED_HEARTBEATS_BEFORE_EJECTION = 3
 MAX_WORKER_POLL_MS = 25_000
+DEFAULT_MAX_SESSIONS = 64
+DEFAULT_MAX_USERS = 1024
+DEFAULT_MAX_SUBMISSIONS = 2048
+DEFAULT_MAX_ENDED_MATCHES = 1024
+DEFAULT_HISTORY_TTL_S = 3600.0
+DEFAULT_MAX_FEED_ENDPOINTS = 2
+
+
+@dataclass(frozen=True)
+class ArenaLimits:
+    """Process-local bounds for state retained by this demonstration server."""
+
+    max_users: int = DEFAULT_MAX_USERS
+    max_submissions: int = DEFAULT_MAX_SUBMISSIONS
+    max_ended_matches: int = DEFAULT_MAX_ENDED_MATCHES
+    history_ttl_s: float = DEFAULT_HISTORY_TTL_S
 
 
 # --------------------------------------------------------------------------
@@ -237,6 +253,10 @@ class BadRequest(Exception):
 
 class SubmissionClosed(Exception):
     """The match changed state while a SUBMIT request was being validated."""
+
+
+class ArenaCapacityExceeded(Exception):
+    """A bounded arena collection cannot accept another record."""
 
 
 # --------------------------------------------------------------------------
@@ -370,6 +390,7 @@ class Submission:
     created_at: float
     stage: str = "QUEUED"
     verdict: Optional[dict] = None          # the profiler's payload, once judged
+    finished_at: float = 0.0
 
     @property
     def done(self) -> bool:
@@ -390,6 +411,7 @@ class Match:
     deadline: float = 0.0                   # set when the clock starts
     winner: Optional[str] = None
     end_reason: str = ""
+    ended_at: float = 0.0
     submissions: List[str] = field(default_factory=list)
 
     def remaining_ms(self, now: float) -> int:
@@ -599,7 +621,8 @@ class Arena:
                  countdown: float, submit_cooldown: float, room_cooldown: float,
                  problem_id: Optional[str], room_capacity: int, allow_panic: bool,
                  worker_token: str = "",
-                 worker_heartbeat_ms: int = DEFAULT_WORKER_HEARTBEAT_MS):
+                 worker_heartbeat_ms: int = DEFAULT_WORKER_HEARTBEAT_MS,
+                 limits: Optional[ArenaLimits] = None):
         self.log = log
         self.min_players = min_players
         self.match_seconds = match_seconds
@@ -611,6 +634,7 @@ class Arena:
         self.allow_panic = allow_panic
         self.worker_token = worker_token
         self.worker_heartbeat_ms = max(250, int(worker_heartbeat_ms))
+        self.limits = limits or ArenaLimits()
 
         self._lock = threading.RLock()
 
@@ -621,6 +645,7 @@ class Arena:
         self.matches: Dict[str, Match] = {}
         self.submissions: Dict[str, Submission] = {}
         self.workers: Dict[str, WorkerRecord] = {}
+        self._feed_tokens: Dict[str, str] = {}
 
         self.jobs = JobQueue()
         self.pool: Optional[LocalJudgePool] = None
@@ -689,11 +714,15 @@ class Arena:
         if session.worker_id is not None:
             self.unregister_worker(session, reason="connection closed")
             with self._lock:
+                if session.token:
+                    self._feed_tokens.pop(session.token, None)
                 self.sessions.pop(session.id, None)
                 session.state = State.CLOSED
             return
 
         with self._lock:
+            if session.token:
+                self._feed_tokens.pop(session.token, None)
             self.sessions.pop(session.id, None)
             if session.id in self.lobby:
                 self.lobby.remove(session.id)
@@ -716,8 +745,20 @@ class Arena:
         with self._lock:
             if name in self.users:
                 return False
+            if len(self.users) >= self.limits.max_users:
+                raise ArenaCapacityExceeded("user capacity reached")
             self.users[name] = password
             return True
+
+    def issue_feed_token(self, session: Session) -> str:
+        """Issue a token and index it for O(1) UDP ATTACH lookup."""
+        with self._lock:
+            if session.token:
+                self._feed_tokens.pop(session.token, None)
+            token = secrets.token_hex(16)
+            session.token = token
+            self._feed_tokens[token] = session.id
+            return token
 
     def check_password(self, name: str, password: str) -> bool:
         """Constant-time-ish credential check.
@@ -936,6 +977,9 @@ class Arena:
         assigned.
         """
         with self._lock:
+            self._prune_history_locked(time.monotonic())
+            if len(self.submissions) >= self.limits.max_submissions:
+                raise ArenaCapacityExceeded("submission capacity reached")
             if (self.sessions.get(session.id) is not session
                     or session.match_id != match.id
                     or match.state is not MatchState.RUNNING
@@ -1063,6 +1107,7 @@ class Arena:
                 return False
             submission.verdict = verdict
             submission.stage = "DONE"
+            submission.finished_at = time.monotonic()
             session = self.sessions.get(submission.session_id)
             match = self.matches.get(submission.match_id)
 
@@ -1317,6 +1362,7 @@ class Arena:
             match.state = MatchState.ENDED
             match.end_reason = reason
             match.winner = winner
+            match.ended_at = time.monotonic()
             sessions = self.match_sessions(match)
             for session in sessions:
                 session.match_id = None
@@ -1343,15 +1389,56 @@ class Arena:
     def session_for_feed_token(self, token: str) -> Optional[Session]:
         """Resolve a display-scoped UDP attach token to its logged-in TCP session."""
         with self._lock:
-            for session in self.sessions.values():
-                if session.authenticated and session.token == token:
-                    return session
+            session_id = self._feed_tokens.get(token)
+            session = self.sessions.get(session_id or "")
+            if session is not None and session.authenticated and session.token == token:
+                return session
         return None
+
+    def prune_history(self, now: Optional[float] = None) -> None:
+        with self._lock:
+            self._prune_history_locked(time.monotonic() if now is None else now)
+
+    def _prune_history_locked(self, now: float) -> None:
+        """Remove only completed history; jobs and active matches are never pruned."""
+        ttl = self.limits.history_ttl_s
+        removable = [s for s in self.submissions.values() if s.done and s.finished_at
+                     and now - s.finished_at >= ttl]
+        completed = sorted((s for s in self.submissions.values() if s.done),
+                           key=lambda s: s.finished_at or s.created_at)
+        overflow = max(0, len(self.submissions) - self.limits.max_submissions)
+        removable.extend(completed[:overflow])
+        for submission in {s.id: s for s in removable}.values():
+            self.submissions.pop(submission.id, None)
+            session = self.sessions.get(submission.session_id)
+            if session and submission.id in session.submissions:
+                session.submissions.remove(submission.id)
+            match = self.matches.get(submission.match_id)
+            if match and submission.id in match.submissions:
+                match.submissions.remove(submission.id)
+        eligible = [m for m in self.matches.values() if m.state is MatchState.ENDED
+                    and m.ended_at and now - m.ended_at >= ttl
+                    and all(sid not in self.submissions for sid in m.submissions)]
+        ended = sorted((m for m in self.matches.values() if m.state is MatchState.ENDED
+                        and all(sid not in self.submissions for sid in m.submissions)),
+                       key=lambda m: m.ended_at or m.created_at)
+        overflow = max(0, len(ended) - self.limits.max_ended_matches)
+        eligible.extend(ended[:overflow])
+        for match in {m.id: m for m in eligible}.values():
+            self.matches.pop(match.id, None)
+            for session in self.sessions.values():
+                if session.last_match_id == match.id:
+                    session.last_match_id = None
 
     def feed_session_alive(self, session_id: str, user: str) -> bool:
         with self._lock:
             session = self.sessions.get(session_id)
             return bool(session and session.authenticated and session.user == user)
+
+    def feed_session_is_alive(self, session_id: str) -> bool:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            return bool(session and session.authenticated)
 
     def feed_snapshots(self, now: float) -> List[dict]:
         """Copy the display-only state used to build UDP TICK/CLOCK/BOARD datagrams."""
@@ -1390,6 +1477,7 @@ class Arena:
                     "match": match.id,
                     "remain": match.remaining_ms(now),
                     "players": players,
+                    "session_ids": [sid for sid in match.session_ids if sid in self.sessions],
                 })
         return snapshots
 
@@ -1886,7 +1974,12 @@ class _ClientHandler:
         worth more here than the round trip costs.
         """
         user, password = self._credentials(self._json_request(message))
-        if not self.arena.create_user(user, password):
+        try:
+            created = self.arena.create_user(user, password)
+        except ArenaCapacityExceeded:
+            return self._error(message, Status.JUDGE_UNAVAILABLE, phrase="SERVER_BUSY",
+                               detail="account capacity reached; try again later")
+        if not created:
             return self._error(message, Status.CONFLICT, phrase="USER_EXISTS",
                                detail=f"the name {user!r} is already registered")
         return self._ok(message, Status.CREATED, phrase="REGISTERED",
@@ -1910,7 +2003,7 @@ class _ClientHandler:
                                detail="unknown user or wrong password")
 
         self.session.user = user
-        self.session.token = secrets.token_hex(8)
+        self.session.token = self.arena.issue_feed_token(self.session)
         self.session.state = State.IDLE
         return self._ok(message, Status.OK, headers={
             "User": user,
@@ -2208,6 +2301,9 @@ class _ClientHandler:
                                    detail=f"match {match.id} ended; submissions closed")
             return self._error(message, Status.FORBIDDEN, phrase="WRONG_STATE",
                                detail="the clock has not started yet; wait for MATCH_START")
+        except ArenaCapacityExceeded:
+            return self._error(message, Status.JUDGE_UNAVAILABLE, phrase="SERVER_BUSY",
+                               detail="submission history is at capacity; try again later")
         # Queue it only after the 202 is on the wire — see Arena.create_submission for why
         # a fast verdict beating its own submission id is a real problem and not a
         # theoretical one.
@@ -2309,7 +2405,9 @@ class ArenaServer:
     """
 
     def __init__(self, arena: Arena, log: WireLog, *, host: str, tcp_port: int,
-                 udp_port: Optional[int], idle_timeout: float, backlog: int = 16):
+                 udp_port: Optional[int], idle_timeout: float, backlog: int = 16,
+                 max_sessions: int = DEFAULT_MAX_SESSIONS,
+                 max_feed_endpoints: int = DEFAULT_MAX_FEED_ENDPOINTS):
         self.arena = arena
         self.log = log
         self.host = host
@@ -2317,11 +2415,14 @@ class ArenaServer:
         self.udp_port = udp_port
         self.idle_timeout = idle_timeout
         self.backlog = backlog
+        self.max_feed_endpoints = max_feed_endpoints
+        self._session_slots = threading.BoundedSemaphore(max_sessions)
 
         self.stopping = False
         self._listener: Optional[socket.socket] = None
         self._udp_socket: Optional[socket.socket] = None
-        self._threads: List[threading.Thread] = []
+        self._threads: set[threading.Thread] = set()
+        self._threads_lock = threading.Lock()
         self._udp_lock = threading.Lock()
         # user -> {UDP source address -> authenticated TCP session id}. Keeping the session
         # id lets the broadcaster discard an endpoint as soon as its attach session closes.
@@ -2335,13 +2436,10 @@ class ArenaServer:
         self._listener = self._bind()
         if self.udp_port:
             self._udp_socket = self._bind_udp()
-        tick = threading.Thread(target=self._tick_loop, name="tick", daemon=True)
-        tick.start()
+        self._start_thread(self._tick_loop, "tick")
 
         if self._udp_socket is not None:
-            udp = threading.Thread(target=self._udp_loop, name="udp-feed", daemon=True)
-            udp.start()
-            self._threads.append(udp)
+            self._start_thread(self._udp_loop, "udp-feed")
 
         self.log.note(f"arena listening on {self.host}:{self.tcp_port} (TCP) — "
                       f"protocol {PROTOCOL_VERSION}")
@@ -2387,7 +2485,40 @@ class ArenaServer:
                 if self.stopping:
                     return
                 raise
+            if not self._session_slots.acquire(blocking=False):
+                self._reject_busy(sock)
+                continue
             self._start_session(sock, address)
+
+    def _start_thread(self, target, name: str, args=()) -> threading.Thread:
+        """Track threads only while alive, so completed sessions are reaped."""
+        thread: Optional[threading.Thread] = None
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                with self._threads_lock:
+                    if thread is not None:
+                        self._threads.discard(thread)
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        with self._threads_lock:
+            self._threads.add(thread)
+        thread.start()
+        return thread
+
+    def _reject_busy(self, sock: socket.socket) -> None:
+        try:
+            sock.sendall(Message.response(
+                Status.JUDGE_UNAVAILABLE, phrase="SERVER_BUSY",
+                headers={"Detail": "concurrent session limit reached"},
+            ).encode())
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def _start_session(self, sock: socket.socket, address) -> None:
         """Wrap one accepted socket in a session and give it its two threads."""
@@ -2408,13 +2539,8 @@ class ArenaServer:
         self.log.note(f"connection from {conn.peer} → session {session.id}")
 
         handler = _ClientHandler(self, session)
-        reader = threading.Thread(target=self._run_session, name=f"read-{session.id}",
-                                  args=(handler, session), daemon=True)
-        writer = threading.Thread(target=self._writer_loop, name=f"write-{session.id}",
-                                  args=(session,), daemon=True)
-        reader.start()
-        writer.start()
-        self._threads.extend((reader, writer))
+        self._start_thread(self._run_session, f"read-{session.id}", (handler, session))
+        self._start_thread(self._writer_loop, f"write-{session.id}", (session,))
 
     def _run_session(self, handler: "_ClientHandler", session: Session) -> None:
         """Run one session's reader thread and clean up however it ends."""
@@ -2429,6 +2555,8 @@ class ArenaServer:
             session.stop_writer()
             self.arena.drop_session(session)
             session.conn.close()
+            self._remove_feed_endpoints(session.id)
+            self._session_slots.release()
             self.log.note(f"session {session.id} ({session.label}) closed")
 
     def _writer_loop(self, session: Session) -> None:
@@ -2458,6 +2586,7 @@ class ArenaServer:
                 self.arena.start_pending_matches(now)
                 self.arena.expire_matches(now)
                 self.arena.expire_worker_leases(now)
+                self.arena.prune_history(now)
                 self._broadcast_udp(now)
             except Exception as exc:                      # noqa: BLE001
                 # This thread must not die. If it did, matches would never start and never
@@ -2496,7 +2625,11 @@ class ArenaServer:
                 self.log.udp_dropped(f"ATTACH from {peer}: unknown or expired session token")
                 continue
             with self._udp_lock:
-                self._feed_endpoints.setdefault(session.user, {})[address] = session.id
+                endpoints = self._feed_endpoints.setdefault(session.id, {})
+                endpoints.pop(address, None)
+                endpoints[address] = time.monotonic()
+                while len(endpoints) > self.max_feed_endpoints:
+                    endpoints.pop(next(iter(endpoints)))
             self.log.note(f"UDP feed attached for {session.user} from source address {peer}")
 
     def _broadcast_udp(self, now: float) -> None:
@@ -2505,7 +2638,7 @@ class ArenaServer:
             return
         for snapshot in self.arena.feed_snapshots(now):
             players = snapshot["players"]
-            targets = self._feed_targets([player["user"] for player in players])
+            targets = self._feed_targets(snapshot["session_ids"])
             if not targets:
                 continue
             match_id = snapshot["match"]
@@ -2534,19 +2667,23 @@ class ArenaServer:
                 "e": board,
             }, targets)
 
-    def _feed_targets(self, users: List[str]) -> set:
+    def _feed_targets(self, session_ids: List[str]) -> set:
         with self._udp_lock:
             targets = set()
-            for user in users:
-                endpoints = self._feed_endpoints.get(user, {})
-                for address, session_id in list(endpoints.items()):
-                    if self.arena.feed_session_alive(session_id, user):
+            for session_id in session_ids:
+                endpoints = self._feed_endpoints.get(session_id, {})
+                for address in list(endpoints):
+                    if self.arena.feed_session_is_alive(session_id):
                         targets.add(address)
                     else:
                         endpoints.pop(address, None)
                 if not endpoints:
-                    self._feed_endpoints.pop(user, None)
+                    self._feed_endpoints.pop(session_id, None)
             return targets
+
+    def _remove_feed_endpoints(self, session_id: str) -> None:
+        with self._udp_lock:
+            self._feed_endpoints.pop(session_id, None)
 
     def _next_feed_seq(self, match_id: str) -> int:
         with self._udp_lock:
@@ -2600,6 +2737,15 @@ class ArenaServer:
                 pass
         for session in sessions:
             session.conn.close()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with self._threads_lock:
+                threads = list(self._threads)
+            if not threads:
+                break
+            for thread in threads:
+                if thread is not threading.current_thread():
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
         self.log.note("arena stopped")
 
 
@@ -2648,6 +2794,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--idle-timeout", type=float, default=600.0,
                         help="seconds a connection may sit silent before 408 "
                              "REQUEST_TIMEOUT (default: 600)")
+    parser.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS,
+                        help=f"maximum concurrent TCP sessions (default: {DEFAULT_MAX_SESSIONS})")
+    parser.add_argument("--max-users", type=int, default=DEFAULT_MAX_USERS,
+                        help=f"maximum registered accounts per process (default: {DEFAULT_MAX_USERS})")
+    parser.add_argument("--max-submissions", type=int, default=DEFAULT_MAX_SUBMISSIONS,
+                        help=f"maximum retained submissions (default: {DEFAULT_MAX_SUBMISSIONS})")
+    parser.add_argument("--max-ended-matches", type=int, default=DEFAULT_MAX_ENDED_MATCHES,
+                        help=f"maximum retained completed matches (default: {DEFAULT_MAX_ENDED_MATCHES})")
+    parser.add_argument("--history-ttl", type=float, default=DEFAULT_HISTORY_TTL_S,
+                        help=f"seconds to retain completed history (default: {DEFAULT_HISTORY_TTL_S:.0f})")
+    parser.add_argument("--max-feed-endpoints", type=int, default=DEFAULT_MAX_FEED_ENDPOINTS,
+                        help=f"UDP endpoints allowed per session (default: {DEFAULT_MAX_FEED_ENDPOINTS})")
     parser.add_argument("--allow-panic", action="store_true",
                         help="enable DEBUG_PANIC, which raises on purpose so "
                              "500 INTERNAL_ERROR can be demonstrated")
@@ -2669,6 +2827,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     capabilities.enable_utf8_output()
 
     args = build_parser().parse_args(argv)
+    for name in ("max_sessions", "max_users", "max_submissions", "max_ended_matches",
+                 "history_ttl", "max_feed_endpoints"):
+        if getattr(args, name) <= 0:
+            build_parser().error(f"--{name.replace('_', '-')} must be positive")
     log = WireLog(stream=sys.stdout, verbose=args.verbose, prefix="")
 
     arena = Arena(
@@ -2683,6 +2845,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         allow_panic=args.allow_panic,
         worker_token=args.worker_token,
         worker_heartbeat_ms=args.worker_heartbeat_ms,
+        limits=ArenaLimits(
+            max_users=args.max_users,
+            max_submissions=args.max_submissions,
+            max_ended_matches=args.max_ended_matches,
+            history_ttl_s=args.history_ttl,
+        ),
     )
 
     pool = LocalJudgePool(arena, size=max(0, args.judges), backend_name=args.backend)
@@ -2714,6 +2882,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         tcp_port=args.tcp_port,
         udp_port=args.udp_port,
         idle_timeout=args.idle_timeout,
+        max_sessions=args.max_sessions,
+        max_feed_endpoints=args.max_feed_endpoints,
     )
     try:
         server.serve_forever()

@@ -74,7 +74,8 @@ Optimize for explainability.
    correlation.
 5. **The UDP channel carries display data only**, and is unauthenticated beyond the attach
    token. That is a stated security boundary in the report. Do not put anything sensitive or
-   state-changing there.
+   state-changing there. The client connects to the configured arena endpoint and bounds feed
+   sequence/history state, but this is source validation rather than cryptographic authentication.
 6. **`Body-SHA256` is verified**, and a mismatch is `422 BODY_HASH_MISMATCH`. The client's
    `--tamper` flag exists to trigger it on camera.
 

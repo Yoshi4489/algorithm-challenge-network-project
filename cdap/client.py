@@ -110,11 +110,14 @@ class UdpFeed:
     def start(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("0.0.0.0", 0))
+        # A connected UDP socket accepts datagrams only from this arena endpoint on
+        # supported platforms. The feed remains display-only and unauthenticated.
+        sock.connect((self.host, self.port))
         sock.settimeout(0.5)
         self.sock = sock
         fields = {"session": self.token}
         data = encode_datagram("ATTACH", fields)
-        sock.sendto(data, (self.host, self.port))
+        sock.send(data)
         self.log.udp_sent("ATTACH", fields, peer=f"{self.host}:{self.port}")
         self.thread = threading.Thread(target=self._receive_loop, name="udp-feed", daemon=True)
         self.thread.start()
@@ -133,18 +136,22 @@ class UdpFeed:
         assert self.sock is not None
         while not self.closed:
             try:
-                data, address = self.sock.recvfrom(2048)
+                data = self.sock.recv(2048)
             except socket.timeout:
                 continue
             except OSError:
                 return
-            peer = f"{address[0]}:{address[1]}"
+            peer = f"{self.host}:{self.port}"
             try:
                 if not data.startswith((PROTOCOL_VERSION + " ").encode("ascii")):
                     raise ProtocolError(f"UDP feed requires {PROTOCOL_VERSION}")
                 kind, fields = decode_datagram(data)
             except (ProtocolError, FrameTooLarge) as exc:
                 self.log.udp_dropped(f"malformed datagram from {peer}: {exc}")
+                continue
+
+            if kind not in {"TICK", "CLOCK", "BOARD"}:
+                self.log.udp_dropped(f"unexpected {kind} from {peer}")
                 continue
 
             if self.loss_probability and random.random() < self.loss_probability:
@@ -165,7 +172,7 @@ class UdpFeed:
                 continue
             if not self.latest.accept(match_id, seq):
                 highest = self.latest.highest(match_id)
-                self.log.udp_dropped(f"stale seq={seq} <= {highest}, dropped")
+                self.log.udp_dropped(f"stale or excessive seq={seq}, highest={highest}, dropped")
                 continue
             self.log.udp_received(kind, fields, peer=peer)
 
