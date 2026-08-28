@@ -58,6 +58,8 @@ other, while ``--judges 0`` makes the isolation boundary visible by requiring re
 from __future__ import annotations
 
 import argparse
+import hashlib
+import ipaddress
 import json
 import queue
 import secrets
@@ -67,6 +69,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from collections import defaultdict, deque
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import capabilities
@@ -83,7 +86,7 @@ from .protocol import (
     encode_datagram,
 )
 from .status import Status, Verdict, format_status
-from .judge.backends import make_backend
+from .judge.backends import DockerBackend, make_backend
 from .judge.profiler import judge_record
 from .judge.runner import run_budget_ms
 
@@ -122,6 +125,7 @@ ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 #: tidiness: a username is echoed into a ``Detail`` header and into UDP datagram fields, so
 #: constraining it at the point of entry is the cheapest place to stop header injection.
 MAX_USERNAME = 24
+MAX_PASSWORD = 128
 USERNAME_EXTRA_CHARS = "_-."
 
 #: Bound on a session's pending events. A client that stops reading gets its oldest events
@@ -153,6 +157,11 @@ DEFAULT_MAX_SUBMISSIONS = 2048
 DEFAULT_MAX_ENDED_MATCHES = 1024
 DEFAULT_HISTORY_TTL_S = 3600.0
 DEFAULT_MAX_FEED_ENDPOINTS = 2
+DEFAULT_MAX_PENDING_JOBS = 128
+LOGIN_WINDOW_S = 60.0
+REGISTRATION_WINDOW_S = 600.0
+MAX_FAILED_LOGINS_PER_IP = 5
+MAX_REGISTRATIONS_PER_IP = 10
 
 
 @dataclass(frozen=True)
@@ -163,6 +172,15 @@ class ArenaLimits:
     max_submissions: int = DEFAULT_MAX_SUBMISSIONS
     max_ended_matches: int = DEFAULT_MAX_ENDED_MATCHES
     history_ttl_s: float = DEFAULT_HISTORY_TTL_S
+    max_pending_jobs: int = DEFAULT_MAX_PENDING_JOBS
+
+
+@dataclass(frozen=True)
+class PasswordRecord:
+    """Salted password verifier; the arena never retains recoverable passwords."""
+
+    salt: bytes
+    digest: bytes
 
 
 # --------------------------------------------------------------------------
@@ -326,17 +344,17 @@ class Session:
                 return
             self._event_id += 1
             event_id = self._event_id
-
-        fields = dict(headers or {})
-        fields["Event-Id"] = event_id
-        message = Message.make_event(name, headers=fields, body=body)
-
-        try:
-            self.outbox.put_nowait(message)
-        except queue.Full:
-            # Drop the oldest, keep the newest: a stalled client is better served by
-            # current information than by a backlog it will never catch up on. Logged
-            # because a silently dropped VERDICT would be baffling from the outside.
+            fields = dict(headers or {})
+            fields["Event-Id"] = event_id
+            message = Message.make_event(name, headers=fields, body=body)
+            try:
+                self.outbox.put_nowait(message)
+                return
+            except queue.Full:
+                # This whole drop-and-put sequence is under the same lock as the id
+                # allocation.  Otherwise producer B could enqueue Event-Id 2 before
+                # producer A enqueued Event-Id 1.
+                pass
             try:
                 self.outbox.get_nowait()
             except queue.Empty:
@@ -413,6 +431,7 @@ class Match:
     end_reason: str = ""
     ended_at: float = 0.0
     submissions: List[str] = field(default_factory=list)
+    score: Dict[str, Tuple[int, int]] = field(default_factory=dict)  # session -> (best passed, attempts)
 
     def remaining_ms(self, now: float) -> int:
         if self.state is not MatchState.RUNNING:
@@ -458,13 +477,43 @@ class JobQueue:
     the other exists.
     """
 
-    def __init__(self):
+    def __init__(self, max_pending: int = DEFAULT_MAX_PENDING_JOBS):
         self._queue: "queue.Queue[Optional[Job]]" = queue.Queue()
+        self._max_pending = max(1, max_pending)
         self._pending = 0
         self._lock = threading.Lock()
 
-    def put(self, job: Job) -> int:
+    def reserve(self) -> Optional[int]:
+        """Reserve a queue slot before accepting source into retained arena state."""
+        with self._lock:
+            if self._pending >= self._max_pending:
+                return None
+            self._pending += 1
+            return self._pending
+
+    def put_reserved(self, job: Job) -> None:
+        """Publish a previously reserved job after its 202 response has been written."""
+        self._queue.put(job)
+
+    def cancel_reservation(self) -> None:
+        with self._lock:
+            self._pending = max(0, self._pending - 1)
+
+    def put(self, job: Job) -> Optional[int]:
         """Enqueue a job and return its 1-based position in the queue."""
+        position = self.reserve()
+        if position is None:
+            return None
+        self.put_reserved(job)
+        return position
+
+    def requeue(self, job: Job) -> int:
+        """Return a leased job without losing it to concurrent new reservations.
+
+        A pulled job already has retained source and must never be discarded merely
+        because a new SUBMIT won the last ordinary admission slot while its worker was
+        being ejected.  This restores the slot consumed by ``get`` atomically.
+        """
         with self._lock:
             self._pending += 1
             position = self._pending
@@ -485,6 +534,10 @@ class JobQueue:
     def depth(self) -> int:
         with self._lock:
             return self._pending
+
+    @property
+    def capacity(self) -> int:
+        return self._max_pending
 
     def wake_all(self, count: int) -> None:
         """Push ``count`` shutdown sentinels so every blocked consumer wakes and exits."""
@@ -638,7 +691,7 @@ class Arena:
 
         self._lock = threading.RLock()
 
-        self.users: Dict[str, str] = {}                  # username -> password
+        self.users: Dict[str, PasswordRecord] = {}       # username -> salted verifier
         self.sessions: Dict[str, Session] = {}
         self.lobby: List[str] = []                       # session ids, oldest first
         self.rooms: Dict[str, Room] = {}
@@ -647,8 +700,10 @@ class Arena:
         self.workers: Dict[str, WorkerRecord] = {}
         self._feed_tokens: Dict[str, str] = {}
 
-        self.jobs = JobQueue()
+        self.jobs = JobQueue(self.limits.max_pending_jobs)
         self.pool: Optional[LocalJudgePool] = None
+        self._failed_logins: Dict[str, deque[float]] = defaultdict(deque)
+        self._registrations: Dict[str, deque[float]] = defaultdict(deque)
 
         self._session_counter = 0
         self._match_counter = 0
@@ -740,6 +795,43 @@ class Arena:
 
     # -- accounts ----------------------------------------------------------
 
+    @staticmethod
+    def _password_record(password: str) -> PasswordRecord:
+        salt = secrets.token_bytes(16)
+        return PasswordRecord(
+            salt=salt,
+            digest=hashlib.scrypt(password.encode("utf-8"), salt=salt,
+                                 n=2**14, r=8, p=1, dklen=32),
+        )
+
+    @staticmethod
+    def _peer_ip(session: Session) -> str:
+        return session.conn.peer.rsplit(":", 1)[0].strip("[]")
+
+    @staticmethod
+    def _allow(bucket: Dict[str, deque[float]], key: str, limit: int, window_s: float) -> bool:
+        now = time.monotonic()
+        entries = bucket[key]
+        while entries and now - entries[0] >= window_s:
+            entries.popleft()
+        if len(entries) >= limit:
+            return False
+        entries.append(now)
+        return True
+
+    def allow_registration(self, session: Session) -> bool:
+        with self._lock:
+            return self._allow(self._registrations, self._peer_ip(session),
+                               MAX_REGISTRATIONS_PER_IP, REGISTRATION_WINDOW_S)
+
+    def allow_login_attempt(self, session: Session, success: bool) -> bool:
+        with self._lock:
+            key = self._peer_ip(session)
+            if success:
+                self._failed_logins.pop(key, None)
+                return True
+            return self._allow(self._failed_logins, key, MAX_FAILED_LOGINS_PER_IP, LOGIN_WINDOW_S)
+
     def create_user(self, name: str, password: str) -> bool:
         """True if the account was created, False if the name is taken."""
         with self._lock:
@@ -747,7 +839,7 @@ class Arena:
                 return False
             if len(self.users) >= self.limits.max_users:
                 raise ArenaCapacityExceeded("user capacity reached")
-            self.users[name] = password
+            self.users[name] = self._password_record(password)
             return True
 
     def issue_feed_token(self, session: Session) -> str:
@@ -772,7 +864,9 @@ class Arena:
             stored = self.users.get(name)
         if stored is None:
             return False
-        return secrets.compare_digest(stored, password)
+        candidate = hashlib.scrypt(password.encode("utf-8"), salt=stored.salt,
+                                   n=2**14, r=8, p=1, dklen=32)
+        return secrets.compare_digest(stored.digest, candidate)
 
     # -- lobby and matchmaking ---------------------------------------------
 
@@ -982,10 +1076,16 @@ class Arena:
             self._prune_history_locked(time.monotonic())
             if len(self.submissions) >= self.limits.max_submissions:
                 raise ArenaCapacityExceeded("submission capacity reached")
+            position = self.jobs.reserve()
+            if position is None:
+                raise ArenaCapacityExceeded("pending judge queue is full")
             if (self.sessions.get(session.id) is not session
                     or session.match_id != match.id
                     or match.state is not MatchState.RUNNING
                     or time.monotonic() >= match.deadline):
+                # The reservation has no associated source yet, so returning it here
+                # is safe and keeps a deadline race from consuming queue capacity.
+                self.jobs.cancel_reservation()
                 raise SubmissionClosed("match is no longer accepting submissions")
             submission = Submission(
                 id=self._next_submission_id(),
@@ -999,10 +1099,12 @@ class Arena:
             )
             self.submissions[submission.id] = submission
             match.submissions.append(submission.id)
+            passed, attempts = match.score.get(session.id, (0, 0))
+            match.score[session.id] = (passed, attempts + 1)
             session.submissions.append(submission.id)
             session.last_submit_at = submission.created_at
 
-        return submission, self.jobs.depth() + 1
+        return submission, position
 
     def dispatch_submission(self, submission: Submission) -> int:
         """Queue an already-recorded submission for judging and announce it.
@@ -1020,7 +1122,8 @@ class Arena:
                 "opcode_counter": self.capabilities.opcode_counter_name,
             },
         )
-        position = self.jobs.put(job)
+        self.jobs.put_reserved(job)
+        position = self.jobs.depth()
 
         with self._lock:
             session = self.sessions.get(submission.session_id)
@@ -1112,6 +1215,14 @@ class Arena:
             submission.finished_at = time.monotonic()
             session = self.sessions.get(submission.session_id)
             match = self.matches.get(submission.match_id)
+            if match is not None:
+                current, attempts = match.score.get(submission.session_id, (0, 0))
+                summary = str(verdict.get("tests_passed", "0/0"))
+                try:
+                    passed = int(summary.partition("/")[0])
+                except ValueError:
+                    passed = 0
+                match.score[submission.session_id] = (max(current, passed), attempts)
 
         code = int(verdict.get("verdict", int(Verdict.JUDGE_ERROR)))
         body = json.dumps(verdict, indent=2).encode("utf-8")
@@ -1191,7 +1302,7 @@ class Arena:
                 if submission is not None and not submission.done:
                     job = record.active_job
         if job is not None:
-            position = self.jobs.put(job)
+            position = self.jobs.requeue(job)
             self.set_stage(job.submission_id, "QUEUED")
             self.log.note(f"worker {worker_id} {reason}; requeued {job.submission_id} "
                           f"at position {position}")
@@ -1233,7 +1344,7 @@ class Arena:
                     current.lease_deadline = now + self.worker_lease_ms / 1000.0
                     return job
             if should_requeue:
-                self.jobs.put(job)
+                self.jobs.requeue(job)
             if time.monotonic() >= deadline:
                 return None
 
@@ -1460,24 +1571,12 @@ class Arena:
                     session = self.sessions.get(session_id)
                     if session is None or session.user is None:
                         continue
-                    attempts = [
-                        self.submissions[sub_id]
-                        for sub_id in match.submissions
-                        if sub_id in self.submissions
-                        and self.submissions[sub_id].session_id == session_id
-                    ]
-                    passed = 0
-                    for attempt in attempts:
-                        text = str((attempt.verdict or {}).get("tests_passed", "0/0"))
-                        try:
-                            passed = max(passed, int(text.partition("/")[0]))
-                        except ValueError:
-                            pass
+                    passed, attempts = match.score.get(session_id, (0, 0))
                     players.append({
                         "user": session.user,
                         "passed": passed,
                         "total": total,
-                        "subs": len(attempts),
+                        "subs": attempts,
                     })
                 snapshots.append({
                     "match": match.id,
@@ -1765,6 +1864,10 @@ class _ClientHandler:
 
     def _worker_identity(self, message: Message) -> Tuple[Optional[str], Optional[Message]]:
         """Validate the worker id and pre-shared token carried by a worker request."""
+        if not self.arena.worker_token:
+            return None, self._error(message, Status.JUDGE_UNAVAILABLE,
+                                     phrase="WORKERS_DISABLED",
+                                     detail="remote workers are disabled until --worker-token is set")
         worker_id = str(message.headers.get("Worker", "")).strip()
         if not worker_id:
             return None, self._error(message, Status.BAD_REQUEST,
@@ -1798,14 +1901,20 @@ class _ClientHandler:
         enters the arena, is cheaper and far more reliable than escaping it everywhere it
         is later printed.
         """
-        user = str(payload.get("user", "")).strip()
-        password = str(payload.get("pass", ""))
+        raw_user = payload.get("user", "")
+        raw_password = payload.get("pass", "")
+        if not isinstance(raw_user, str) or not isinstance(raw_password, str):
+            raise BadRequest("'user' and 'pass' must both be strings")
+        user = raw_user.strip()
+        password = raw_password
         if not user:
             raise BadRequest("'user' is required")
         if not password:
             raise BadRequest("'pass' is required")
         if len(user) > MAX_USERNAME:
             raise BadRequest(f"username is longer than {MAX_USERNAME} characters")
+        if len(password) > MAX_PASSWORD:
+            raise BadRequest(f"password is longer than {MAX_PASSWORD} characters")
         for character in user:
             if not (character.isalnum() or character in USERNAME_EXTRA_CHARS):
                 raise BadRequest(
@@ -1979,6 +2088,9 @@ class _ClientHandler:
         and buys a demo where ``201`` and ``200`` are visibly different events, which is
         worth more here than the round trip costs.
         """
+        if not self.arena.allow_registration(self.session):
+            return self._error(message, Status.RATE_LIMITED,
+                               detail="too many registrations from this address; try again later")
         user, password = self._credentials(self._json_request(message))
         try:
             created = self.arena.create_user(user, password)
@@ -2002,7 +2114,11 @@ class _ClientHandler:
         which the threat model states plainly (design invariant 5).
         """
         user, password = self._credentials(self._json_request(message))
-        if not self.arena.check_password(user, password):
+        valid = self.arena.check_password(user, password)
+        if not self.arena.allow_login_attempt(self.session, valid):
+            return self._error(message, Status.RATE_LIMITED,
+                               detail="too many failed logins from this address; try again shortly")
+        if not valid:
             # One message for both "no such account" and "wrong password", deliberately:
             # distinguishing them would turn LOGIN into a way to enumerate usernames.
             return self._error(message, Status.AUTH_FAILED,
@@ -2307,7 +2423,10 @@ class _ClientHandler:
                                    detail=f"match {match.id} ended; submissions closed")
             return self._error(message, Status.FORBIDDEN, phrase="WRONG_STATE",
                                detail="the clock has not started yet; wait for MATCH_START")
-        except ArenaCapacityExceeded:
+        except ArenaCapacityExceeded as exc:
+            if "pending judge queue" in str(exc):
+                return self._error(message, Status.JUDGE_UNAVAILABLE, phrase="JUDGE_QUEUE_FULL",
+                                   detail="the judge queue is full; retry after a verdict arrives")
             return self._error(message, Status.JUDGE_UNAVAILABLE, phrase="SERVER_BUSY",
                                detail="submission history is at capacity; try again later")
         # Queue it only after the 202 is on the wire — see Arena.create_submission for why
@@ -2782,6 +2901,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "503 JUDGE_UNAVAILABLE (default: 2)")
     parser.add_argument("--backend", choices=("subprocess", "docker"), default="subprocess",
                         help="how a submission is isolated (default: subprocess)")
+    parser.add_argument("--allow-insecure-remote", action="store_true",
+                        help="allow a non-loopback bind for a controlled demo only; requires "
+                             "the Docker backend. CDAP does not provide TLS")
     parser.add_argument("--worker-token", default="",
                         help="pre-shared token required by remote WORKER_* clients")
     parser.add_argument("--worker-heartbeat-ms", type=int,
@@ -2813,6 +2935,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"maximum registered accounts per process (default: {DEFAULT_MAX_USERS})")
     parser.add_argument("--max-submissions", type=int, default=DEFAULT_MAX_SUBMISSIONS,
                         help=f"maximum retained submissions (default: {DEFAULT_MAX_SUBMISSIONS})")
+    parser.add_argument("--max-pending-jobs", type=int, default=DEFAULT_MAX_PENDING_JOBS,
+                        help=f"maximum queued judge jobs before 503 JUDGE_QUEUE_FULL "
+                             f"(default: {DEFAULT_MAX_PENDING_JOBS})")
     parser.add_argument("--max-ended-matches", type=int, default=DEFAULT_MAX_ENDED_MATCHES,
                         help=f"maximum retained completed matches (default: {DEFAULT_MAX_ENDED_MATCHES})")
     parser.add_argument("--history-ttl", type=float, default=DEFAULT_HISTORY_TTL_S,
@@ -2830,6 +2955,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Recognise only unambiguous local binds; unknown DNS names are remote by policy."""
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     # The wire log is a graded deliverable, so this happens before anything is printed:
     # the markers → ← ✗ need a UTF-8 console, and on Windows the default code page is not
@@ -2840,11 +2975,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     capabilities.enable_utf8_output()
 
     args = build_parser().parse_args(argv)
-    for name in ("max_sessions", "max_users", "max_submissions", "max_ended_matches",
+    for name in ("max_sessions", "max_users", "max_submissions", "max_pending_jobs", "max_ended_matches",
                  "history_ttl", "max_feed_endpoints"):
         if getattr(args, name) <= 0:
             build_parser().error(f"--{name.replace('_', '-')} must be positive")
     log = WireLog(stream=sys.stdout, verbose=args.verbose, prefix="")
+    remote = not _is_loopback_host(args.host)
+    if remote and not args.allow_insecure_remote:
+        log.note("refusing non-loopback bind without --allow-insecure-remote; CDAP has no TLS")
+        return 2
+    if remote:
+        if args.backend != "docker":
+            log.note("remote demo requires --backend docker; subprocess is not a containment boundary")
+            return 2
+        docker_ok, docker_reason = DockerBackend().available()
+        if not docker_ok:
+            log.note(f"remote demo requires Docker: {docker_reason}")
+            return 2
+        log.note("WARNING: remote CDAP is plaintext and intended only for a controlled demo")
 
     arena = Arena(
         log,
@@ -2861,6 +3009,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         limits=ArenaLimits(
             max_users=args.max_users,
             max_submissions=args.max_submissions,
+            max_pending_jobs=args.max_pending_jobs,
             max_ended_matches=args.max_ended_matches,
             history_ttl_s=args.history_ttl,
         ),

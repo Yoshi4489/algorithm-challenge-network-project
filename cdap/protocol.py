@@ -45,6 +45,7 @@ goes to the event handler. Giving events a ``Seq`` would break that, which is wh
 from __future__ import annotations
 
 import hashlib
+import json
 import socket
 import sys
 import threading
@@ -77,6 +78,33 @@ MAX_DATAGRAM_BYTES = 1400           # stays under a typical 1500-byte MTU, so no
 #: How much of a body the wire log shows inline. The full length is always printed
 #: even when the content is cut, because the length is part of the framing story.
 LOG_BODY_PREVIEW = 96
+
+# Values in these fields are bearer credentials or passwords.  Wire logging is a
+# teaching aid, never an excuse to put secrets in terminal history or recordings.
+_SENSITIVE_FIELDS = frozenset({"pass", "password", "token", "worker-token", "authorization"})
+
+
+def _safe_log_text(value) -> str:
+    """Render untrusted text without allowing it to control the terminal."""
+    text = str(value)
+    return "".join(
+        f"\\x{ord(character):02x}" if ord(character) < 32 or 127 <= ord(character) <= 159
+        else character
+        for character in text
+    )
+
+
+def _redact_json(value):
+    """Copy JSON-like data with credential-shaped keys replaced."""
+    if isinstance(value, dict):
+        return {
+            key: ("<redacted>" if str(key).casefold() in _SENSITIVE_FIELDS
+                  else _redact_json(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json(item) for item in value]
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -728,8 +756,9 @@ class WireLog:
         if message.body:
             self._emit(self._body_line(message))
         if self.verbose:
-            for header_line in message.headers.render():
-                self._emit(f"        {header_line}")
+            for name in sorted(message.headers):
+                value = "<redacted>" if name.casefold() in _SENSITIVE_FIELDS else message.headers[name]
+                self._emit(f"        {canonical_header(name)}: {_safe_log_text(value)}")
 
     def _header_summary(self, message) -> str:
         """Headers as ``Name=value``, in a fixed order so the log stays greppable.
@@ -742,12 +771,22 @@ class WireLog:
         for name in sorted(message.headers):
             if name == "content-length" and not message.body:
                 continue
-            rendered.append(f"{canonical_header(name)}={message.headers[name]}")
+            value = "<redacted>" if name.casefold() in _SENSITIVE_FIELDS else message.headers[name]
+            rendered.append(f"{canonical_header(name)}={_safe_log_text(value)}")
         return " ".join(rendered)
 
     def _body_line(self, message) -> str:
         """One truncated preview line. The full length is always stated."""
-        text = message.text().replace("\n", "\\n").replace("\r", "")
+        text = message.text()
+        # Authentication bodies are JSON.  Preserve useful structure while ensuring a
+        # password never reaches stdout; non-JSON bodies are still safely escaped below.
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError):
+            pass
+        else:
+            text = json.dumps(_redact_json(decoded), ensure_ascii=False, separators=(", ", ": "))
+        text = _safe_log_text(text)
         shown = text[:LOG_BODY_PREVIEW]
         suffix = "..." if len(text) > LOG_BODY_PREVIEW else ""
         if self.verbose:
@@ -796,7 +835,7 @@ class WireLog:
         """
         parts = []
         for name, value in fields.items():
-            text = str(value)
+            text = "<redacted>" if str(name).casefold() in _SENSITIVE_FIELDS else _safe_log_text(value)
             if " " in text:
                 text = f'"{text}"'
             parts.append(f"{name}={text}")
@@ -807,7 +846,7 @@ class WireLog:
 
     def note(self, text):
         """Server/client lifecycle lines: binding a port, a match starting, a kill."""
-        self._emit(f"[     ] {text}")
+        self._emit(f"[     ] {_safe_log_text(text)}")
 
     def status(self, code, phrase=None, detail=""):
         """Print a status with its phrase, for the paths that report one outside a frame."""
