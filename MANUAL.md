@@ -29,6 +29,10 @@ py -3.14 -m cdap.server --min-players 1
 Leave this terminal running. It is the arena server and prints every TCP frame, UDP datagram,
 status code, and status phrase.
 
+Keep this first run on `127.0.0.1`. If you intentionally bind to a LAN address, CDAP requires
+`--allow-insecure-remote --backend docker`; it is still plaintext and suitable only for a
+controlled demonstration, not public use.
+
 For a normal two-player game, use the default server command instead:
 
 ```powershell
@@ -221,7 +225,9 @@ a forfeit. Stop the server with `Ctrl+C` in its terminal.
 
 | Problem | What to do |
 |---|---|
-| `503 JUDGE_UNAVAILABLE` on submit | Start the server without `--judges 0`, or connect a remote worker. |
+| `503 JUDGE_UNAVAILABLE` on submit | Start the server without `--judges 0`, or connect a remote worker configured with the same non-empty `--worker-token`. |
+| `503 WORKERS_DISABLED` | The server has no `--worker-token`; local judges still work, but remote workers are intentionally disabled. |
+| `503 JUDGE_QUEUE_FULL` | The bounded judge queue is busy. Wait for a verdict, then submit again. |
 | `503 SERVER_BUSY` | The server reached a configured capacity limit; wait for a session to close or restart with a higher limit. |
 | `403 NOT_IN_MATCH` | Run `queue` and wait for `MATCH_START` before submitting. |
 | `403 WRONG_STATE` | The match countdown has not finished yet. |

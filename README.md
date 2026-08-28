@@ -48,12 +48,13 @@ CDAP แบ่ง traffic เป็น 2 ประเภทที่มีคว
 ## Quick start
 
 ```bash
-# Terminal 1 — arena server
-python -m cdap.server --tcp-port 5050 --udp-port 5051 -v
+# Terminal 1 — local arena server (loopback/subprocess is for trusted demos only)
+python -m cdap.server --tcp-port 5050 --udp-port 5051 --worker-token demo -v
 
 # Terminals 2-3 — judge workers (the pool that executes untrusted code)
-python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w1
-python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w2
+# To use remote workers, start the arena with --worker-token demo and pass --token demo here.
+python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w1 --token demo
+python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w2 --token demo
 
 # Terminal 4 — player, compact game view
 python -m cdap.client --host 127.0.0.1 --user alice
@@ -72,6 +73,11 @@ code and phrase.
 
 Requires **Python 3.9+** (3.14 tested). No third-party packages needed. `psutil` and Docker
 are optional — see [Sandbox](#sandbox).
+
+Security default: the server binds only to loopback by default. A non-loopback bind is refused
+unless `--allow-insecure-remote --backend docker` is supplied. That is a controlled-demo escape
+hatch, not TLS: CDAP control traffic is plaintext, so do not expose it to the Internet. Empty
+`--worker-token` disables all `WORKER_*` methods.
 
 Check what your interpreter and machine can actually do before anything else:
 
