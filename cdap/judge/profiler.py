@@ -492,6 +492,18 @@ def judge_record(record: dict, contract: dict, outcome_hint: Optional[str] = Non
     ops_block = record.get("ops", {})
     space_block = record.get("space", {})
 
+    # A partial profile is evidence of neither compliant nor non-compliant growth.  In
+    # particular, accepting after the space pass raised at one large input lets a tailored
+    # program evade the space contract.  A harness failure is 612; a budget/noise limited
+    # but otherwise valid measurement is 611.  Neither path may reach 600.
+    for label, block in (("time", time_block), ("space", space_block)):
+        if not block.get("complete", False):
+            notes = "; ".join(block.get("notes", [])) or "no complete measurement"
+            code = (Verdict.JUDGE_ERROR if "failed" in notes or "unavailable" in notes
+                    else Verdict.INDETERMINATE_COMPLEXITY)
+            return _verdict(code, record, contract,
+                            detail=f"{label} profile is incomplete: {notes}")
+
     # -- 603: the absolute memory ceiling ----------------------------------
     # About a single run's peak, not about growth. A solution allocating a fixed 96 MB has
     # perfectly O(1) space growth and is still over a 64 MB limit.

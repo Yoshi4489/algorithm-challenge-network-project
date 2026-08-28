@@ -386,6 +386,7 @@ def measure_time(function, generate, sizes, size_cap) -> dict:
         "repeats": TIME_REPEATS,
         "noise_floor_ms": MIN_MEASURABLE_S * 1000,
         "notes": notes,
+        "complete": len(samples) == len(ladder),
     }
 
 
@@ -514,6 +515,7 @@ def measure_ops(function, generate, sizes, counter_name: str) -> dict:
             "reason": "no usable opcode-counting mechanism on this interpreter",
             "samples": {},
             "sizes": [],
+            "complete": False,
         }
 
     samples: Dict[int, int] = {}
@@ -565,6 +567,7 @@ def measure_ops(function, generate, sizes, counter_name: str) -> dict:
         "samples": {str(n): count for n, count in sorted(samples.items())},
         "sizes": sorted(samples),
         "notes": notes,
+        "complete": len(samples) == len(sizes),
     }
 
 
@@ -596,6 +599,7 @@ def measure_space(function, generate, sizes) -> dict:
             "reason": "tracemalloc.reset_peak is unavailable (needs Python 3.9+)",
             "samples_kb": {},
             "sizes": [],
+            "complete": False,
         }
 
     samples: Dict[int, float] = {}
@@ -633,6 +637,7 @@ def measure_space(function, generate, sizes) -> dict:
         "samples_kb": {str(n): round(kb, 3) for n, kb in sorted(samples.items())},
         "sizes": sorted(samples),
         "notes": notes,
+        "complete": len(samples) == len(sizes),
     }
 
 

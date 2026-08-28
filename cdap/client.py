@@ -173,10 +173,27 @@ class PlayerView:
 
     def terminal(self, name: str, headers) -> None:
         self.stop_countdown()
+        match = headers.get("Match")
+        if match:
+            self.clear_match(match)
         self.banner(name, headers.get("Detail", ""))
 
     def warning(self, text: str) -> None:
         self._print(f"  ! UDP warning: {text}")
+
+    def clear_match(self, match: str) -> None:
+        with self._lock:
+            self._last_remaining.pop(match, None)
+            self._announced_milestones.pop(match, None)
+            self._scores.pop(match, None)
+
+    def verdict(self, lines: List[str]) -> None:
+        """One atomic presentation block; background feed output cannot split it."""
+        with self._lock:
+            print("", flush=True)
+            for line in lines:
+                print(line, flush=True)
+            print("", flush=True)
 
     @staticmethod
     def _format_ms(value) -> str:
@@ -295,6 +312,8 @@ class UdpFeed:
         self.closed = False
         self.sock: Optional[socket.socket] = None
         self.thread: Optional[threading.Thread] = None
+        self._warning_count = 0
+        self._warning_last = 0.0
 
     def start(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -378,8 +397,18 @@ class UdpFeed:
                 self.on_update(kind, fields)
 
     def _warn(self, reason: str) -> None:
-        if self.on_warning is not None:
-            self.on_warning(reason)
+        if self.on_warning is None:
+            return
+        now = time.monotonic()
+        self._warning_count += 1
+        # One immediate warning, then at most one summary every five seconds. A bad UDP
+        # sender must not recreate the exact terminal flood compact mode prevents.
+        if self._warning_count == 1 or now - self._warning_last >= 5.0:
+            extra = self._warning_count - 1
+            suffix = f" ({extra} similar packets suppressed)" if extra else ""
+            self.on_warning(reason + suffix)
+            self._warning_last = now
+            self._warning_count = 0
 
 
 class _Pending:
@@ -646,9 +675,12 @@ class CdapClient:
             self.view.match_start(headers)
             self._on_match_start(headers)
         elif name == "MATCH_END":
+            ended_match = headers.get("Match") or self.match_id
             self.in_match = False
             self.match_id = None
             self.queued = False
+            if ended_match:
+                self.view.clear_match(ended_match)
         elif name == "VERDICT":
             self._on_verdict(message)
         elif name == "ROOM_UPDATE":
@@ -661,16 +693,29 @@ class CdapClient:
         """Fetch the newly revealed problem, then optionally submit a scripted file."""
         path = self.auto_submit
         self.auto_submit = None         # once per match, not once per event
-        self._actions.put(lambda: self._fetch_problem_then_submit(path))
+        match_id = headers.get("Match") or self.match_id
+        self._actions.put(lambda: self._fetch_problem_then_submit(match_id, path))
 
-    def _fetch_problem_then_submit(self, path: Optional[str]) -> None:
+    def _fetch_problem_then_submit(self, match_id: Optional[str], path: Optional[str]) -> None:
+        if not match_id or not self.in_match or self.match_id != match_id:
+            self.log.note("match ended before automatic problem fetch; action skipped")
+            return
         problem = self.request("GET_PROBLEM")
         if is_success(problem.status):
             self.view.show_problem(problem)
-        if path is not None:
+        else:
+            self.log.note("automatic GET_PROBLEM failed: "
+                          f"{describe_status(problem.status, problem.phrase)} — "
+                          f"{problem.headers.get('Detail', 'no detail')}")
+            return
+        if path is not None and self.in_match and self.match_id == match_id:
             self.log.note(f"auto-submitting {path} for "
                           f"{problem.headers.get('Problem', '?')}")
-            self.submit_file(path)
+            response = self.submit_file(path)
+            if not is_success(response.status):
+                self.log.note("automatic SUBMIT failed: "
+                              f"{describe_status(response.status, response.phrase)} — "
+                              f"{response.headers.get('Detail', 'no detail')}")
 
     def _on_verdict(self, message: Message) -> None:
         """Render a verdict. The one place the 6xx namespace is displayed to a human.
@@ -694,50 +739,55 @@ class CdapClient:
         # number even if the header is missing.
         line = message.headers.get("Verdict") or (
             describe_status(code, payload.get("phrase")) if code else "unknown verdict")
-        print()
-        print(f"  ===== VERDICT  {line} =====")
-        print(f"  submission : {message.headers.get('Submission', '?')}")
-        print(f"  tests      : {payload.get('tests_passed', '?')}")
+        lines = [
+            f"  ===== VERDICT  {line} =====",
+            f"  submission : {message.headers.get('Submission', '?')}",
+            f"  tests      : {payload.get('tests_passed', '?')}",
+        ]
         if payload.get("detail"):
-            print(f"  detail     : {payload['detail']}")
+            lines.append(f"  detail     : {payload['detail']}")
 
         # Measured versus required, side by side. This is the line that makes a 606 land:
         # "every test passed and you were still rejected" only makes sense once the player
         # can see O(n^2) sitting next to the O(n) they agreed to.
         if payload.get("inferred_time") is not None:
-            print(f"  time       : measured {payload['inferred_time']} "
-                  f"vs required {payload.get('required_time', '?')}"
-                  f"   confidence={payload.get('confidence', '?')}")
-            print(f"  fit        : margin={payload.get('margin', '?')} "
-                  f"rel_rmse={payload.get('rel_rmse', '?')} "
-                  f"log-log slope={payload.get('loglog_slope', '?')}")
+            lines.append(f"  time       : measured {payload['inferred_time']} "
+                         f"vs required {payload.get('required_time', '?')}"
+                         f"   confidence={payload.get('confidence', '?')}")
+            lines.append(f"  fit        : margin={payload.get('margin', '?')} "
+                         f"rel_rmse={payload.get('rel_rmse', '?')} "
+                         f"log-log slope={payload.get('loglog_slope', '?')}")
             if payload.get("fit_reason"):
-                print(f"  reason     : {payload['fit_reason']}")
+                lines.append(f"  reason     : {payload['fit_reason']}")
         if payload.get("inferred_space") is not None:
-            print(f"  space      : measured {payload['inferred_space']} "
-                  f"vs required {payload.get('required_space', '?')}"
-                  f"   confidence={payload.get('space_confidence', '?')}"
-                  f"   peak_aux={payload.get('peak_aux_kb', '?')} KB")
+            lines.append(f"  space      : measured {payload['inferred_space']} "
+                         f"vs required {payload.get('required_space', '?')}"
+                         f"   confidence={payload.get('space_confidence', '?')}"
+                         f"   peak_aux={payload.get('peak_aux_kb', '?')} KB")
         # Method B is shown only when it *disagrees* with Method A. Agreement is the boring
         # case and would just be noise; disagreement is the report's most interesting
         # result (opcode counting cannot see work done inside C builtins), so it earns a
         # line, labelled as informational — Method A remains the one that decides.
         if payload.get("methods_disagree"):
-            print(f"  method B   : {payload.get('method_b_inferred')} "
-                  f"(opcode counting, {payload.get('method_b_mechanism', '?')}) "
-                  f"— disagrees with Method A; Method A decides")
+            lines.append(f"  method B   : {payload.get('method_b_inferred')} "
+                         f"(opcode counting, {payload.get('method_b_mechanism', '?')}) "
+                         f"— disagrees with Method A; Method A decides")
         # The backend is printed for every verdict on purpose: a run that fell back from
         # docker to subprocess had weaker isolation, and the report's conclusions depend on
         # that being visible rather than assumed (design invariant 6).
-        print(f"  backend    : {payload.get('backend', '?')}"
-              f"   worker={payload.get('worker', '-')}"
-              f"   judge_wall={payload.get('judge_wall_ms', '?')} ms")
+        lines.append(f"  backend    : {payload.get('backend', '?')}"
+                     f"   worker={payload.get('worker', '-')}"
+                     f"   judge_wall={payload.get('judge_wall_ms', '?')} ms")
         for failure in (payload.get("failures") or [])[:3]:
-            print(f"  failed     : {failure}")
-        print()
+            lines.append(f"  failed     : {failure}")
+        self.view.verdict(lines)
 
     def _on_terminal(self, name: str, headers) -> None:
         self.view.terminal(name, headers)
+
+    def mark_queued(self) -> None:
+        """Keep both scripted and interactive queue flows on the same state path."""
+        self.queued = True
 
     def _agent_loop(self) -> None:
         """Run the follow-up requests events asked for, one at a time."""
@@ -821,7 +871,7 @@ class CdapClient:
         would do, it proves the request works, and it puts the contract the submission is
         about to be judged against into the log immediately above the submission itself.
         """
-        self._fetch_problem_then_submit(path)
+        self._fetch_problem_then_submit(self.match_id, path)
 
     @staticmethod
     def _why(response: Message) -> str:
@@ -911,7 +961,7 @@ class CommandLoop:
     def _cmd_queue(self, args: List[str]) -> None:
         response = self.client.request("QUEUE")
         if is_success(response.status):
-            self.client.queued = True
+            self.client.mark_queued()
         self._show(response)
 
     def _cmd_dequeue(self, args: List[str]) -> None:
@@ -1177,6 +1227,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.queue:
             response = client.request("QUEUE")
+            if is_success(response.status):
+                client.mark_queued()
             log.note(f"QUEUE → {describe_status(response.status, response.phrase)}")
 
         if args.once:
