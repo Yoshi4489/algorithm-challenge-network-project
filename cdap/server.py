@@ -85,7 +85,7 @@ from .protocol import (
     decode_datagram,
     encode_datagram,
 )
-from .status import Status, Verdict, format_status
+from .status import Status, Verdict, format_status, is_success
 from .judge.backends import DockerBackend, make_backend
 from .judge.profiler import judge_record
 from .judge.runner import (
@@ -134,10 +134,9 @@ MAX_USERNAME = 24
 MAX_PASSWORD = 128
 USERNAME_EXTRA_CHARS = "_-."
 
-#: Bound on a session's pending events. A client that stops reading gets its oldest events
-#: dropped rather than growing the server's memory without limit. Nothing is lost
-#: permanently: ``GET_SUBMISSION`` re-reads a verdict on demand, which is exactly why that
-#: method exists alongside the ``VERDICT`` event.
+#: Bound on a session's pending events. If a client stops reading, progress events are
+#: discarded before match/verdict events. Event-Id gaps and ``GET_STATE`` provide recovery
+#: without allowing an unbounded queue.
 MAX_OUTBOX_EVENTS = 256
 
 #: What the arena calls itself in the ``Server`` header of a ``HELLO`` reply. Version it
@@ -166,10 +165,21 @@ DEFAULT_HISTORY_TTL_S = 3600.0
 DEFAULT_MAX_FEED_ENDPOINTS = 2
 DEFAULT_MAX_PENDING_JOBS = 128
 DEFAULT_MAX_CACHED_VERDICTS = 4096
+DEFAULT_MAX_IDEMPOTENCY_RECORDS = 4096
+MAX_REQUEST_ID_CHARS = 128
 LOGIN_WINDOW_S = 60.0
 REGISTRATION_WINDOW_S = 600.0
 MAX_FAILED_LOGINS_PER_IP = 5
 MAX_REGISTRATIONS_PER_IP = 10
+
+# Retried commands may otherwise create two rooms or two submissions after a response is
+# lost. Old CDAP/1.0 clients remain valid because Request-Id is optional.
+IDEMPOTENT_METHODS = frozenset({
+    "QUEUE", "DEQUEUE", "CREATE_ROOM", "JOIN_ROOM", "READY", "LEAVE", "FORFEIT",
+    "SUBMIT",
+})
+CRITICAL_EVENTS = frozenset({"MATCH_FOUND", "MATCH_START", "VERDICT", "MATCH_END",
+                             "SERVER_SHUTDOWN"})
 
 
 @dataclass(frozen=True)
@@ -189,6 +199,18 @@ class PasswordRecord:
 
     salt: bytes
     digest: bytes
+
+
+@dataclass(frozen=True)
+class CachedResponse:
+    """A replayable response for one successfully completed Request-Id."""
+
+    fingerprint: str
+    status: int
+    phrase: str
+    headers: dict
+    body: bytes
+    keep_open: bool
 
 
 # --------------------------------------------------------------------------
@@ -343,9 +365,9 @@ class Session:
     def push_event(self, name: str, headers: Optional[dict] = None, body=b"") -> None:
         """Queue a server-pushed event for this session.
 
-        Never blocks and never raises. An event is a courtesy — the client can always ask
-        for the same information with a request — so a full outbox drops the oldest event
-        and says so in the log rather than stalling the thread that produced it.
+        Never blocks and never raises. When full, a non-critical progress update is
+        discarded before match/verdict lifecycle events. Event-Id still advances so a
+        receiving client detects the gap and refreshes authoritative state with GET_STATE.
         """
         with self._lock:
             if self.closed:
@@ -363,19 +385,45 @@ class Session:
                 # allocation.  Otherwise producer B could enqueue Event-Id 2 before
                 # producer A enqueued Event-Id 1.
                 pass
-            try:
-                self.outbox.get_nowait()
-            except queue.Empty:
-                pass
-            self.log.note(
-                f"outbox full for {self.label}: dropped the oldest event to make room for "
-                f"{name} (Event-Id={event_id}); the client can re-read state with "
-                f"GET_SUBMISSION"
-            )
-            try:
-                self.outbox.put_nowait(message)
-            except queue.Full:
-                pass
+            # queue.Queue has no priority operation. Its mutex and deque let us perform
+            # one atomic replacement so the writer cannot observe a half-rebuilt queue.
+            # Session never calls queue.join(), so unfinished-task accounting is irrelevant.
+            dropped = None
+            queued = False
+            with self.outbox.mutex:
+                items = self.outbox.queue
+                if len(items) < self.outbox.maxsize:
+                    # The writer freed a slot after put_nowait observed a full queue.
+                    items.append(message)
+                    self.outbox.not_empty.notify()
+                    queued = True
+                elif name in CRITICAL_EVENTS:
+                    victim = next(
+                        (index for index, item in enumerate(items)
+                         if item is not None and item.event not in CRITICAL_EVENTS),
+                        0,
+                    )
+                    old = items[victim]
+                    dropped = old.event if old is not None else "shutdown sentinel"
+                    del items[victim]
+                    items.append(message)
+                    self.outbox.not_empty.notify()
+                    queued = True
+            if queued and dropped is not None:
+                self.log.note(
+                    f"outbox full for {self.label}: dropped {dropped} to preserve critical "
+                    f"{name} (Event-Id={event_id}); the client will recover via GET_STATE"
+                )
+            elif not queued:
+                self.log.note(
+                    f"outbox full for {self.label}: dropped non-critical {name} "
+                    f"(Event-Id={event_id}); the client will recover via GET_STATE"
+                )
+
+    def latest_event_id(self) -> int:
+        """Return the newest allocated event id for a GET_STATE consistency marker."""
+        with self._lock:
+            return self._event_id
 
     def stop_writer(self) -> None:
         """Wake the writer thread so it can exit. ``None`` is the shutdown sentinel."""
@@ -729,6 +777,7 @@ class Arena:
         self._failed_logins: Dict[str, deque[float]] = defaultdict(deque)
         self._registrations: Dict[str, deque[float]] = defaultdict(deque)
         self._verdict_cache: Dict[tuple, dict] = {}
+        self._idempotency_cache: Dict[Tuple[str, str], CachedResponse] = {}
 
         self._session_counter = 0
         self._match_counter = 0
@@ -1238,6 +1287,68 @@ class Arena:
         """
         with self._lock:
             return self.matches.get(session.last_match_id or "")
+
+    def state_snapshot(self, session: Session) -> dict:
+        """Return authoritative player state for reconnect and event-gap recovery."""
+        with self._lock:
+            submissions = [
+                item for item in self.submissions.values() if item.user == session.user
+            ]
+            submissions.sort(key=lambda item: (item.created_at, item.id))
+            recent = submissions[-20:]
+
+            match = self.matches.get(session.match_id or session.last_match_id or "")
+            if match is None and recent:
+                match = self.matches.get(recent[-1].match_id)
+            match_data = None
+            if match is not None:
+                match_data = {
+                    "id": match.id,
+                    "problem": match.problem_id,
+                    "state": match.state.value,
+                    "remaining_ms": match.remaining_ms(time.monotonic()),
+                    "winner": match.winner,
+                    "reason": match.end_reason,
+                }
+
+            return {
+                "user": session.user,
+                "session": session.id,
+                "state": session.state.value,
+                "queued": session.state is State.QUEUED,
+                "room": session.room_code,
+                "match": match_data,
+                "submissions": [
+                    {
+                        "id": item.id,
+                        "match": item.match_id,
+                        "problem": item.problem_id,
+                        "stage": item.stage,
+                        "done": item.done,
+                        "verdict": ((item.verdict or {}).get("verdict") if item.done else None),
+                    }
+                    for item in recent
+                ],
+            }
+
+    def replay_request(self, user: str, request_id: str,
+                       fingerprint: str) -> Tuple[Optional[CachedResponse], bool]:
+        """Return a cached result and whether the key was reused for different content."""
+        with self._lock:
+            cached = self._idempotency_cache.get((user, request_id))
+            if cached is None:
+                return None, False
+            return cached, cached.fingerprint != fingerprint
+
+    def remember_request(self, user: str, request_id: str,
+                         cached: CachedResponse) -> None:
+        """Retain a bounded process-lifetime record of a successful mutation."""
+        with self._lock:
+            key = (user, request_id)
+            if (key not in self._idempotency_cache
+                    and len(self._idempotency_cache) >= DEFAULT_MAX_IDEMPOTENCY_RECORDS):
+                self._idempotency_cache.pop(next(iter(self._idempotency_cache)))
+            self._idempotency_cache[key] = cached
 
     def set_stage(self, submission_id: str, stage: str, worker_id: str = "") -> None:
         """Advance a submission's judging stage and tell the submitter."""
@@ -1849,6 +1960,10 @@ class _ClientHandler:
             try:
                 self.conn.send(response)
             except OSError:
+                # Handlers may already have committed state before deferring the work that
+                # completes it (most importantly, SUBMIT reserves a queue slot here). A
+                # vanished peer must not strand that reservation or lose the judge job.
+                self._run_deferred()
                 return
             self._run_deferred()
             if not keep_open:
@@ -1935,6 +2050,36 @@ class _ClientHandler:
             return self._error(message, Status.AUTH_FAILED,
                                detail=f"{message.method} requires a LOGIN first"), True
 
+        request_id = None
+        fingerprint = ""
+        if session.authenticated and message.method in IDEMPOTENT_METHODS:
+            request_id = str(message.headers.get("Request-Id", "")).strip()
+            if request_id:
+                if len(request_id) > MAX_REQUEST_ID_CHARS or any(
+                        not (character.isascii() and
+                             (character.isalnum() or character in "-._:"))
+                        for character in request_id):
+                    return self._error(
+                        message, Status.BAD_REQUEST,
+                        detail="Request-Id must be at most 128 ASCII letters, digits, or -._:",
+                    ), True
+                fingerprint = self._request_fingerprint(message)
+                cached, conflict = self.arena.replay_request(
+                    session.user or "", request_id, fingerprint,
+                )
+                if conflict:
+                    return self._error(
+                        message, Status.CONFLICT, phrase="IDEMPOTENCY_CONFLICT",
+                        detail="this Request-Id was already used for different content",
+                    ), True
+                if cached is not None:
+                    fields = dict(cached.headers)
+                    fields["Idempotent-Replay"] = "true"
+                    return Message.response(
+                        cached.status, phrase=cached.phrase, headers=fields,
+                        body=cached.body, seq=message.seq,
+                    ), cached.keep_open
+
         if spec.states is not None and session.state not in spec.states:
             return self._error(message, Status.FORBIDDEN, phrase=spec.failure_phrase,
                                detail=f"{message.method} is not allowed in state "
@@ -1956,8 +2101,28 @@ class _ClientHandler:
         # ``(message, keep_open)`` pair only when the connection should not survive the
         # reply — which is LOGOUT and nothing else.
         if isinstance(result, tuple):
-            return result
-        return result, True
+            response, keep_open = result
+        else:
+            response, keep_open = result, True
+
+        if request_id and is_success(response.status):
+            cached_headers = {
+                name: response.headers[name]
+                for name in response.headers
+                if name not in ("seq", "content-length")
+            }
+            self.arena.remember_request(
+                session.user or "", request_id,
+                CachedResponse(
+                    fingerprint=fingerprint,
+                    status=int(response.status),
+                    phrase=response.phrase,
+                    headers=cached_headers,
+                    body=response.body,
+                    keep_open=keep_open,
+                ),
+            )
+        return response, keep_open
 
     # -- building replies --------------------------------------------------
     #
@@ -2015,6 +2180,21 @@ class _ClientHandler:
         """Serialise a JSON body. Indented, because a human reads it in the log."""
         return json.dumps(payload, indent=2).encode("utf-8")
 
+    @staticmethod
+    def _request_fingerprint(message: Message) -> str:
+        """Hash the semantic request fields, excluding transport correlation headers."""
+        headers = [
+            (name, message.headers[name])
+            for name in sorted(message.headers)
+            if name not in ("seq", "request-id", "content-length")
+        ]
+        canonical = json.dumps(
+            {"method": message.method, "headers": headers,
+             "body_sha256": hashlib.sha256(message.body).hexdigest()},
+            sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     def _json_request(self, message: Message) -> dict:
         """Parse a request body as a JSON object, or raise ``BadRequest``.
 
@@ -2027,8 +2207,9 @@ class _ClientHandler:
         if not message.body:
             raise BadRequest(f"{message.method} needs a JSON body")
         try:
-            payload = json.loads(message.text())
-        except ValueError as exc:
+            text = message.body.decode("utf-8", errors="strict")
+            payload = json.loads(text)
+        except (UnicodeDecodeError, ValueError) as exc:
             raise BadRequest(f"body is not valid JSON: {exc}") from exc
         if not isinstance(payload, dict):
             raise BadRequest(f"body must be a JSON object, not {type(payload).__name__}")
@@ -2578,7 +2759,13 @@ class _ClientHandler:
                                detail=f"wait {self.arena.submit_cooldown - elapsed:.1f}s "
                                       f"before submitting again")
 
-        source = message.text()
+        try:
+            source = message.body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            return self._error(
+                message, Status.BAD_REQUEST, phrase="INVALID_SOURCE_ENCODING",
+                detail=f"submission source must be valid UTF-8 (invalid byte at {exc.start})",
+            )
         if not source.strip():
             raise BadRequest("the body must contain the source code to judge")
 
@@ -2642,7 +2829,7 @@ class _ClientHandler:
         if submission is None:
             return self._error(message, Status.NOT_FOUND, phrase="SUBMISSION_NOT_FOUND",
                                detail=f"no submission {submission_id}")
-        if submission.session_id != self.session.id:
+        if submission.user != self.session.user:
             return self._error(message, Status.FORBIDDEN,
                                detail=f"{submission_id} belongs to another player")
 
@@ -2665,6 +2852,18 @@ class _ClientHandler:
         return self._ok(message, Status.OK, headers=headers,
                         body=self._json_body(verdict),
                         detail=f"{submission.id}: {format_status(code)}")
+
+    @method("GET_STATE", states=LOGGED_IN_STATES)
+    def handle_get_state(self, message: Message) -> Message:
+        """Return authoritative state after reconnects or a detected Event-Id gap."""
+        snapshot = self.arena.state_snapshot(self.session)
+        snapshot["latest_event_id"] = self.session.latest_event_id()
+        return self._ok(
+            message, Status.OK,
+            headers={"Content-Type": "application/json"},
+            body=self._json_body(snapshot),
+            detail=f"authoritative state for {self.session.label}",
+        )
 
     # -- debug -------------------------------------------------------------
 

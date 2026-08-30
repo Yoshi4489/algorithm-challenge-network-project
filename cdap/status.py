@@ -98,11 +98,15 @@ DEFAULT_PHRASE = {
 #: Declared explicitly so a typo at a call site is caught by ``phrase_for`` instead
 #: of silently going out on the wire and confusing the other end.
 PHRASE_ALTERNATES = {
+    Status.BAD_REQUEST: ("INVALID_SOURCE_ENCODING",),
     Status.CREATED: ("REGISTERED",),
     Status.ACCEPTED: ("QUEUED",),
     Status.FORBIDDEN: ("NOT_IN_MATCH", "NOT_IN_ROOM", "WRONG_STATE"),
     Status.NOT_FOUND: ("ROOM_NOT_FOUND", "SUBMISSION_NOT_FOUND"),
-    Status.CONFLICT: ("ALREADY_QUEUED", "NOT_QUEUED", "ROOM_FULL", "USER_EXISTS"),
+    Status.CONFLICT: (
+        "ALREADY_QUEUED", "NOT_QUEUED", "ROOM_FULL", "USER_EXISTS",
+        "IDEMPOTENCY_CONFLICT",
+    ),
     Status.RATE_LIMITED: ("SUBMIT_COOLDOWN",),
     Status.JUDGE_UNAVAILABLE: ("SERVER_BUSY", "WORKERS_DISABLED", "JUDGE_QUEUE_FULL"),
 }

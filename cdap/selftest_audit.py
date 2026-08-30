@@ -8,16 +8,19 @@ that are easy to regress during a protocol demonstration.
 from __future__ import annotations
 
 import io
+import json
 import threading
 import unittest
 from types import SimpleNamespace
 
 from .judge.profiler import judge_record
 from .judge.runner import load_solution
+from .client import CdapClient
 from .protocol import Message, WireLog
 from .server import (
     Arena,
     ArenaServer,
+    CachedResponse,
     Job,
     JobQueue,
     Match,
@@ -39,6 +42,7 @@ class AuditRegressionTests(unittest.TestCase):
         arena.log = WireLog(stream=io.StringIO(), use_unicode=False)
         arena.submissions = {}
         arena.matches = {}
+        arena._idempotency_cache = {}
         players = []
         for index, user in enumerate(("alice", "bob"), start=1):
             session = Session(f"c-{index}", SimpleNamespace(), arena.log)
@@ -103,6 +107,105 @@ class AuditRegressionTests(unittest.TestCase):
         arena.resolve_match_after_verdict(match)
         self.assertEqual(MatchState.ENDED, match.state)
         self.assertEqual("alice", match.winner)
+
+    def test_invalid_utf8_submission_is_rejected_without_lossy_decode(self) -> None:
+        arena, match, players = self._bare_arena_with_players()
+        handler = _ClientHandler.__new__(_ClientHandler)
+        handler.session = players[0]
+        handler.arena = SimpleNamespace(
+            current_match=lambda _session: match,
+            last_match=lambda _session: None,
+            submit_cooldown=0,
+        )
+        response = handler.handle_submit(Message.request(
+            "SUBMIT", headers={"Lang": "python"}, body=b"def solve():\n\xff", seq=1,
+        ))
+        self.assertEqual(int(Status.BAD_REQUEST), response.status)
+        self.assertEqual("INVALID_SOURCE_ENCODING", response.phrase)
+
+    def test_reconnected_user_can_read_own_submission(self) -> None:
+        submission = Submission(
+            "s-1", "old-session", "alice", "m-1", "max-subarray", "python", "", 1.0,
+        )
+        session = Session("new-session", SimpleNamespace(), WireLog(stream=io.StringIO()))
+        session.user = "alice"
+        session.state = State.IDLE
+        handler = _ClientHandler.__new__(_ClientHandler)
+        handler.session = session
+        handler.arena = SimpleNamespace(get_submission=lambda _submission_id: submission)
+        response = handler.handle_get_submission(Message.request(
+            "GET_SUBMISSION", body=json.dumps({"submission": "s-1"}), seq=1,
+        ))
+        self.assertEqual(int(Status.ACCEPTED), response.status)
+
+    def test_request_id_replays_before_changed_state_and_detects_conflict(self) -> None:
+        arena, _match, players = self._bare_arena_with_players()
+        session = players[0]
+        session.state = State.IN_MATCH  # QUEUE would now fail its ordinary state check.
+        handler = _ClientHandler.__new__(_ClientHandler)
+        handler.arena = arena
+        handler.session = session
+        handler.log = arena.log
+        handler._deferred = []
+        request = Message.request("QUEUE", headers={"Request-Id": "retry-1"}, seq=7)
+        fingerprint = handler._request_fingerprint(request)
+        arena.remember_request("alice", "retry-1", CachedResponse(
+            fingerprint, int(Status.ACCEPTED), "QUEUED",
+            {"Queue-Pos": "1"}, b"", True,
+        ))
+
+        replay, keep_open = handler._dispatch(request)
+        self.assertTrue(keep_open)
+        self.assertEqual(int(Status.ACCEPTED), replay.status)
+        self.assertEqual("true", replay.headers.get("Idempotent-Replay"))
+        conflicting = Message.request(
+            "QUEUE", headers={"Request-Id": "retry-1"}, body=b"different", seq=8,
+        )
+        conflict, _keep_open = handler._dispatch(conflicting)
+        self.assertEqual(int(Status.CONFLICT), conflict.status)
+        self.assertEqual("IDEMPOTENCY_CONFLICT", conflict.phrase)
+
+    def test_full_outbox_preserves_verdict_over_progress(self) -> None:
+        session = Session("test", SimpleNamespace(), WireLog(stream=io.StringIO()))
+        for _index in range(256):
+            session.push_event("JUDGE_PROGRESS")
+        session.push_event("VERDICT")
+        events = [session.outbox.get_nowait().event for _index in range(256)]
+        self.assertIn("VERDICT", events)
+        self.assertEqual(255, events.count("JUDGE_PROGRESS"))
+
+    def test_client_detects_event_gap_and_schedules_one_resync(self) -> None:
+        client = CdapClient("127.0.0.1", 1, WireLog(stream=io.StringIO()))
+        client._handle_event(Message.make_event("NOTICE", headers={"Event-Id": 3}))
+        self.assertTrue(client._resync_pending)
+        self.assertEqual(3, client._last_event_id)
+        self.assertIsNotNone(client._actions.get_nowait())
+
+    def test_deferred_commit_runs_even_when_response_send_fails(self) -> None:
+        class FailingConnection:
+            def __init__(self):
+                self.first = True
+
+            def recv(self):
+                if self.first:
+                    self.first = False
+                    return Message.request("QUEUE", seq=1)
+                return None
+
+            @staticmethod
+            def send(_message):
+                raise OSError("peer vanished")
+
+        committed = []
+        handler = _ClientHandler.__new__(_ClientHandler)
+        handler.server = SimpleNamespace(stopping=False)
+        handler.session = SimpleNamespace(label="alice")
+        handler.conn = FailingConnection()
+        handler.log = WireLog(stream=io.StringIO())
+        handler._deferred = [lambda: committed.append(True)]
+        handler._dispatch = lambda message: (Message.response(Status.OK, seq=message.seq), True)
+        handler.serve()
+        self.assertEqual([True], committed)
 
     def test_performance_policy_accepts_complete_hidden_evidence(self) -> None:
         record = {

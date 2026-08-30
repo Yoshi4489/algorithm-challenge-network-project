@@ -146,6 +146,8 @@ _CANONICAL_NAMES = {
     "body-sha256": "Body-SHA256",
     "detail": "Detail",
     "event-id": "Event-Id",
+    "request-id": "Request-Id",
+    "idempotent-replay": "Idempotent-Replay",
     "verdict": "Verdict",
     "lang": "Lang",
     "server": "Server",

@@ -53,6 +53,7 @@ import argparse
 import json
 import queue
 import random
+import secrets
 import socket
 import sys
 import threading
@@ -88,6 +89,10 @@ WRONG_VERSION = "CDAP/9.9"
 
 #: Events that mean "the match is over" — the client stops waiting for a verdict on them.
 TERMINAL_EVENTS = ("MATCH_END", "SERVER_SHUTDOWN")
+IDEMPOTENT_METHODS = frozenset({
+    "QUEUE", "DEQUEUE", "CREATE_ROOM", "JOIN_ROOM", "READY", "LEAVE", "FORFEIT",
+    "SUBMIT",
+})
 
 
 class PlayerView:
@@ -473,6 +478,9 @@ class CdapClient:
         self.in_match = False
         self.queued = False
         self.verdicts = deque(maxlen=256)
+        self._last_event_id = 0
+        self._resync_pending = False
+        self._resync_lock = threading.Lock()
         self._threads: List[threading.Thread] = []
 
     # -- connection --------------------------------------------------------
@@ -541,7 +549,11 @@ class CdapClient:
             body = json.dumps(payload).encode("utf-8")
 
         seq = self._next_seq()
-        message = Message.request(method, headers=headers, body=body, seq=seq)
+        request_headers = dict(headers or {})
+        if method.upper() in IDEMPOTENT_METHODS and not any(
+                name.casefold() == "request-id" for name in request_headers):
+            request_headers["Request-Id"] = secrets.token_hex(16)
+        message = Message.request(method, headers=request_headers, body=body, seq=seq)
         if body:
             message.attach_body_hash()
             if self.tamper:
@@ -664,6 +676,18 @@ class CdapClient:
         """
         name = message.event
         headers = message.headers
+        event_id = headers.get_int("Event-Id")
+        if event_id is not None:
+            with self._resync_lock:
+                expected = self._last_event_id + 1
+                gap = event_id > expected
+                self._last_event_id = max(self._last_event_id, event_id)
+            if gap:
+                self.log.note(
+                    f"Event-Id gap: expected {expected}, received {event_id}; "
+                    "requesting authoritative state"
+                )
+                self._schedule_resync()
 
         if name == "MATCH_FOUND":
             self.match_id = headers.get("Match")
@@ -693,6 +717,57 @@ class CdapClient:
 
         if name in TERMINAL_EVENTS:
             self._on_terminal(name, headers)
+
+    def _schedule_resync(self) -> None:
+        """Queue at most one GET_STATE request; the reader thread must never block."""
+        with self._resync_lock:
+            if self._resync_pending:
+                return
+            self._resync_pending = True
+        self._actions.put(self._resync_state)
+
+    def _resync_state(self) -> None:
+        try:
+            response = self.request("GET_STATE")
+            if not is_success(response.status):
+                self.log.note(
+                    "GET_STATE unavailable: "
+                    f"{describe_status(response.status, response.phrase)}"
+                )
+                return
+            try:
+                snapshot = json.loads(response.body.decode("utf-8", errors="strict"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                self.log.note(f"GET_STATE returned invalid JSON: {exc}")
+                return
+            if not isinstance(snapshot, dict):
+                self.log.note("GET_STATE returned a non-object body")
+                return
+
+            snapshot_event_id = int(snapshot.get("latest_event_id", 0))
+            with self._resync_lock:
+                if snapshot_event_id < self._last_event_id:
+                    self.log.note("ignored a stale GET_STATE snapshot")
+                    return
+                self._last_event_id = snapshot_event_id
+
+            match = snapshot.get("match") if isinstance(snapshot.get("match"), dict) else None
+            match_state = str((match or {}).get("state", ""))
+            live_match = match_state in ("PENDING", "RUNNING", "DRAINING")
+            self.match_id = (match or {}).get("id") if live_match else None
+            self.in_match = match_state in ("RUNNING", "DRAINING")
+            self.queued = bool(snapshot.get("queued"))
+            self.room_code = snapshot.get("room")
+            submissions = snapshot.get("submissions") or []
+            if submissions and isinstance(submissions[-1], dict):
+                self.last_submission = submissions[-1].get("id") or self.last_submission
+            self.log.note(
+                f"state synchronized: state={snapshot.get('state', '?')} "
+                f"match={self.match_id or '-'} submissions={len(submissions)}"
+            )
+        finally:
+            with self._resync_lock:
+                self._resync_pending = False
 
     def _on_match_start(self, headers) -> None:
         """Fetch the newly revealed problem, then optionally submit a scripted file."""
@@ -751,6 +826,14 @@ class CdapClient:
         ]
         if payload.get("detail"):
             lines.append(f"  detail     : {payload['detail']}")
+
+        if payload.get("decision_basis") == "performance_limits":
+            lines.append(
+                f"  measured   : cpu={payload.get('cpu_ms', '?')} ms "
+                f"wall={payload.get('wall_ms', '?')} ms "
+                f"peak_aux={payload.get('peak_aux_kb', '?')} KB "
+                f"policy={payload.get('policy_version', '?')}"
+            )
 
         # Measured versus required, side by side. This is the line that makes a 606 land:
         # "every test passed and you were still rejected" only makes sense once the player
@@ -836,6 +919,9 @@ class CdapClient:
         self.token = login.headers.get("Token")
         self.session_id = login.headers.get("Session") or self.session_id
         self.log.note(f"logged in as {self.user} (session {self.session_id})")
+        # A repeated login is a reconnect. Pull the process-lifetime submission history so
+        # a verdict remains discoverable even though Event-Id is connection-local.
+        self._resync_state()
 
     def _print_hello(self, hello: Message) -> None:
         """Show what the arena said it can do. The handshake's whole purpose."""
@@ -1120,8 +1206,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--udp-port", type=int, default=5051,
                         help="arena UDP live-feed port (default: 5051)")
     parser.add_argument("--user", default="alice", help="username (default: alice)")
-    parser.add_argument("--pass", dest="password", default="secret",
-                        help="password (default: secret — this is a coursework arena)")
+    parser.add_argument("--pass", dest="password", default="1234",
+                        help="password (default: 1234 — first run registers this value)")
 
     parser.add_argument("--queue", action="store_true",
                         help="join matchmaking immediately after logging in")
