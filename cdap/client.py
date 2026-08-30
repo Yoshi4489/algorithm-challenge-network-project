@@ -57,6 +57,7 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from typing import Callable, Dict, List, Optional
 
 from . import capabilities
@@ -471,7 +472,7 @@ class CdapClient:
 
         self.in_match = False
         self.queued = False
-        self.verdicts: List[dict] = []
+        self.verdicts = deque(maxlen=256)
         self._threads: List[threading.Thread] = []
 
     # -- connection --------------------------------------------------------
@@ -681,6 +682,10 @@ class CdapClient:
             self.queued = False
             if ended_match:
                 self.view.clear_match(ended_match)
+        elif name == "MATCH_DRAINING":
+            self.view.warning(
+                headers.get("Detail", "submissions closed; accepted jobs are still being judged")
+            )
         elif name == "VERDICT":
             self._on_verdict(message)
         elif name == "ROOM_UPDATE":

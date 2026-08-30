@@ -157,6 +157,7 @@ SUPPORTED_LANGUAGES = ("python",)
 DEFAULT_WORKER_HEARTBEAT_MS = 5_000
 MISSED_HEARTBEATS_BEFORE_EJECTION = 3
 MAX_WORKER_POLL_MS = 25_000
+IDLE_WORKER_TIMEOUT_S = 60.0
 DEFAULT_MAX_SESSIONS = 64
 DEFAULT_MAX_USERS = 1024
 DEFAULT_MAX_SUBMISSIONS = 2048
@@ -164,6 +165,7 @@ DEFAULT_MAX_ENDED_MATCHES = 1024
 DEFAULT_HISTORY_TTL_S = 3600.0
 DEFAULT_MAX_FEED_ENDPOINTS = 2
 DEFAULT_MAX_PENDING_JOBS = 128
+DEFAULT_MAX_CACHED_VERDICTS = 4096
 LOGIN_WINDOW_S = 60.0
 REGISTRATION_WINDOW_S = 600.0
 MAX_FAILED_LOGINS_PER_IP = 5
@@ -397,6 +399,7 @@ class Session:
 class MatchState(Enum):
     PENDING = "PENDING"     # players notified, clock not yet running
     RUNNING = "RUNNING"
+    DRAINING = "DRAINING"   # submissions closed; accepted work is still being judged
     ENDED = "ENDED"
 
 
@@ -428,6 +431,7 @@ class Match:
     id: str
     problem_id: str
     session_ids: List[str]
+    active_session_ids: set
     duration_s: float
     created_at: float
     starts_at: float                        # when PENDING becomes RUNNING
@@ -438,8 +442,11 @@ class Match:
     ended_at: float = 0.0
     submissions: List[str] = field(default_factory=list)
     score: Dict[str, Tuple[int, int]] = field(default_factory=dict)  # session -> (best passed, attempts)
+    terminal_notified: set = field(default_factory=set)
 
     def remaining_ms(self, now: float) -> int:
+        if self.state is MatchState.DRAINING or self.state is MatchState.ENDED:
+            return 0
         if self.state is not MatchState.RUNNING:
             return int(self.duration_s * 1000)
         return max(0, int((self.deadline - now) * 1000))
@@ -570,6 +577,7 @@ class LocalJudgePool:
         self.arena = arena
         self.size = size
         self.backend_name = backend_name
+        self.actual_backend_name = backend_name
         self.guard = guard
         self.profile = profile
         self._threads: List[threading.Thread] = []
@@ -582,6 +590,7 @@ class LocalJudgePool:
 
     def start(self) -> None:
         self._running = True
+        self.actual_backend_name = make_backend(self.backend_name).name
         for index in range(self.size):
             thread = threading.Thread(
                 target=self._judge_loop,
@@ -933,6 +942,7 @@ class Arena:
             id=self._next_match_id(),
             problem_id=self._next_problem_id(),
             session_ids=[player.id for player in players],
+            active_session_ids={player.id for player in players},
             duration_s=self.match_seconds,
             created_at=now,
             starts_at=now + self.countdown,
@@ -968,9 +978,13 @@ class Arena:
             f"{', '.join(s.label for s in self.match_sessions(match))}"
         )
 
-    def match_sessions(self, match: Match) -> List[Session]:
+    def match_sessions(self, match: Match, *, active_only: bool = False) -> List[Session]:
         with self._lock:
-            return [self.sessions[sid] for sid in match.session_ids if sid in self.sessions]
+            return [
+                self.sessions[sid]
+                for sid in match.session_ids
+                if sid in self.sessions and (not active_only or sid in match.active_session_ids)
+            ]
 
     # -- rooms -------------------------------------------------------------
 
@@ -1149,7 +1163,11 @@ class Arena:
         with self._lock:
             submission = self.submissions.get(submission_id)
             if submission is not None:
-                self._verdict_cache[self._verdict_cache_key(submission)] = canonical
+                key = self._verdict_cache_key(submission)
+                if (key not in self._verdict_cache
+                        and len(self._verdict_cache) >= DEFAULT_MAX_CACHED_VERDICTS):
+                    self._verdict_cache.pop(next(iter(self._verdict_cache)))
+                self._verdict_cache[key] = canonical
 
     def dispatch_submission(self, submission: Submission) -> int:
         """Queue an already-recorded submission for judging and announce it.
@@ -1300,11 +1318,57 @@ class Arena:
         self.log.status(code, detail=f"{submission_id} by {submission.user} "
                                      f"({submission.problem_id}, backend={backend_name})")
 
-        # 600 ACCEPTED is the only verdict that wins a match. Everything else — including a
-        # 606 for a correct-but-too-slow solution — leaves the clock running.
-        if match is not None and code == int(Verdict.ACCEPTED):
-            self.end_match(match, reason="SOLVED", winner=submission.user)
+        # Worker completion order is not a fair tie-breaker. Resolve by submission time and
+        # wait for every earlier accepted job before declaring the first valid attempt.
+        if match is not None:
+            self.resolve_match_after_verdict(match)
         return True
+
+    def _notify_draining(self, match: Match, detail: str) -> None:
+        for session in self.match_sessions(match, active_only=True):
+            session.push_event("MATCH_DRAINING", headers={
+                "Match": match.id,
+                "Detail": _header_safe(detail),
+            })
+
+    def resolve_match_after_verdict(self, match: Match) -> None:
+        """End on the earliest accepted submission, never the fastest worker result."""
+        action = None
+        entered_draining = False
+        with self._lock:
+            if match.state is MatchState.ENDED:
+                return
+            submissions = [
+                self.submissions[sid] for sid in match.submissions if sid in self.submissions
+            ]
+            submissions.sort(key=lambda item: (item.created_at, item.id))
+            accepted = [
+                item for item in submissions
+                if item.done and int((item.verdict or {}).get("verdict", 0)) == int(Verdict.ACCEPTED)
+            ]
+            if accepted:
+                candidate = accepted[0]
+                earlier_pending = any(
+                    not item.done
+                    for item in submissions
+                    if (item.created_at, item.id) < (candidate.created_at, candidate.id)
+                )
+                if earlier_pending:
+                    if match.state is MatchState.RUNNING:
+                        match.state = MatchState.DRAINING
+                        entered_draining = True
+                else:
+                    action = ("SOLVED", candidate.user)
+            elif match.state is MatchState.DRAINING and all(item.done for item in submissions):
+                action = ("TIMEOUT", None)
+
+        if entered_draining:
+            self._notify_draining(
+                match,
+                "an accepted attempt is waiting for earlier submissions; new submissions are closed",
+            )
+        if action is not None:
+            self.end_match(match, reason=action[0], winner=action[1])
 
     # -- remote judge workers --------------------------------------------
 
@@ -1350,6 +1414,7 @@ class Arena:
             if record is None or record.session_id != session.id:
                 return
             self.workers.pop(worker_id, None)
+            session.worker_id = None
             if record.active_job is not None:
                 submission = self.submissions.get(record.active_job.submission_id)
                 if submission is not None and not submission.done:
@@ -1452,16 +1517,23 @@ class Arena:
         return True, ""
 
     def expire_worker_leases(self, now: float) -> None:
-        """Eject workers that missed three heartbeats and reclaim their active jobs."""
+        """Eject workers that stopped polling or renewing an active job."""
         expired_sessions = []
+        reasons = {}
         with self._lock:
             for record in list(self.workers.values()):
                 if record.active_job is not None and record.lease_deadline <= now:
                     session = self.sessions.get(record.session_id)
                     if session is not None:
                         expired_sessions.append(session)
+                        reasons[session.id] = "missed three heartbeats and was ejected"
+                elif record.active_job is None and now - record.last_seen >= IDLE_WORKER_TIMEOUT_S:
+                    session = self.sessions.get(record.session_id)
+                    if session is not None:
+                        expired_sessions.append(session)
+                        reasons[session.id] = "stopped polling and was ejected"
         for session in expired_sessions:
-            self.unregister_worker(session, reason="missed three heartbeats and was ejected")
+            self.unregister_worker(session, reason=reasons[session.id])
 
     # -- match lifecycle ---------------------------------------------------
 
@@ -1496,14 +1568,30 @@ class Arena:
                           f"({int(match.duration_s)}s on the clock)")
 
     def expire_matches(self, now: float) -> None:
-        """End any match whose clock has run out."""
+        """Close submissions at the deadline and drain every already-accepted job."""
         expired: List[Match] = []
+        draining: List[Match] = []
         with self._lock:
             for match in self.matches.values():
                 if match.state is MatchState.RUNNING and now >= match.deadline:
-                    expired.append(match)
+                    pending = any(
+                        sid in self.submissions and not self.submissions[sid].done
+                        for sid in match.submissions
+                    )
+                    if pending:
+                        match.state = MatchState.DRAINING
+                        draining.append(match)
+                    else:
+                        expired.append(match)
+        for match in draining:
+            self._notify_draining(
+                match,
+                "the clock expired; submissions are closed while accepted jobs finish",
+            )
         for match in expired:
-            self.end_match(match, reason="TIMEOUT", winner=None)
+            self.resolve_match_after_verdict(match)
+            if match.state is not MatchState.ENDED:
+                self.end_match(match, reason="TIMEOUT", winner=None)
 
     def forfeit(self, session: Session, reason: str = "FORFEIT") -> Optional[Match]:
         """One player gives up. The last one standing wins; a solo match just ends."""
@@ -1511,13 +1599,24 @@ class Arena:
             match = self.matches.get(session.match_id or "")
             if match is None or match.state is MatchState.ENDED:
                 return None
-            if session.id in match.session_ids:
-                match.session_ids.remove(session.id)
+            match.active_session_ids.discard(session.id)
             session.match_id = None
             if session.state is State.IN_MATCH:
                 session.state = State.IDLE
             survivors = [self.sessions[sid] for sid in match.session_ids
-                         if sid in self.sessions]
+                         if sid in match.active_session_ids and sid in self.sessions]
+            forfeit_winner = survivors[0].label if len(survivors) == 1 else None
+            notify_forfeiter = session.id in self.sessions and session.id not in match.terminal_notified
+            if notify_forfeiter:
+                match.terminal_notified.add(session.id)
+
+        if notify_forfeiter:
+            session.push_event("MATCH_END", headers={
+                "Match": match.id,
+                "Detail": _header_safe(
+                    f"reason={reason} winner={forfeit_winner or 'none'} (you forfeited)"
+                ),
+            })
 
         if len(survivors) == 1:
             self.end_match(match, reason=reason, winner=survivors[0].label)
@@ -1534,8 +1633,12 @@ class Arena:
             match.end_reason = reason
             match.winner = winner
             match.ended_at = time.monotonic()
-            sessions = self.match_sessions(match)
-            for session in sessions:
+            sessions = [
+                session for session in self.match_sessions(match)
+                if session.id not in match.terminal_notified
+            ]
+            match.terminal_notified.update(session.id for session in sessions)
+            for session in self.match_sessions(match):
                 session.match_id = None
                 if session.state is State.IN_MATCH:
                     session.state = State.IDLE
@@ -1572,6 +1675,16 @@ class Arena:
 
     def _prune_history_locked(self, now: float) -> None:
         """Remove only completed history; jobs and active matches are never pruned."""
+        for bucket, window in (
+            (self._failed_logins, LOGIN_WINDOW_S),
+            (self._registrations, REGISTRATION_WINDOW_S),
+        ):
+            for key, entries in list(bucket.items()):
+                while entries and now - entries[0] >= window:
+                    entries.popleft()
+                if not entries:
+                    bucket.pop(key, None)
+
         ttl = self.limits.history_ttl_s
         removable = [s for s in self.submissions.values() if s.done and s.finished_at
                      and now - s.finished_at >= ttl]
@@ -1622,6 +1735,8 @@ class Arena:
                 total = len(problem.tests)
                 players = []
                 for session_id in match.session_ids:
+                    if session_id not in match.active_session_ids:
+                        continue
                     session = self.sessions.get(session_id)
                     if session is None or session.user is None:
                         continue
@@ -1636,7 +1751,10 @@ class Arena:
                     "match": match.id,
                     "remain": match.remaining_ms(now),
                     "players": players,
-                    "session_ids": [sid for sid in match.session_ids if sid in self.sessions],
+                    "session_ids": [
+                        sid for sid in match.session_ids
+                        if sid in match.active_session_ids and sid in self.sessions
+                    ],
                 })
         return snapshots
 
@@ -2122,7 +2240,7 @@ class _ClientHandler:
             "min_players": self.arena.min_players,
             "languages": ["python"],
             "judge": {
-                "backend": self.arena.pool.backend_name if self.arena.pool else "remote",
+                "backend": self.arena.pool.actual_backend_name if self.arena.pool else "remote",
                 "healthy": self.arena.judge_healthy(),
                 "remote_workers": self.arena.remote_worker_count(),
                 "opcode_counter": self.arena.capabilities.opcode_counter_name,
@@ -2439,6 +2557,11 @@ class _ClientHandler:
         if match.state is MatchState.ENDED:
             return self._error(message, Status.MATCH_ENDED, headers={"Match": match.id},
                                detail=f"match {match.id} ended ({match.end_reason})")
+        if match.state is MatchState.DRAINING:
+            return self._error(
+                message, Status.MATCH_ENDED, headers={"Match": match.id},
+                detail=f"match {match.id} is draining submissions accepted before the deadline",
+            )
         if match.state is MatchState.PENDING:
             return self._error(message, Status.FORBIDDEN, phrase="WRONG_STATE",
                                detail="the clock has not started yet; wait for MATCH_START")
@@ -2608,7 +2731,7 @@ class ArenaServer:
         # user -> {UDP source address -> authenticated TCP session id}.  A separate
         # feed-only login for the same user should see that user's game, while the session
         # id still lets cleanup discard endpoints when their attach session closes.
-        self._feed_endpoints: Dict[str, dict] = {}
+        self._feed_endpoints: Dict[str, Dict[tuple, str]] = {}
         self._feed_seq: Dict[str, int] = {}
 
     # -- lifecycle ---------------------------------------------------------
@@ -2809,7 +2932,7 @@ class ArenaServer:
             with self._udp_lock:
                 endpoints = self._feed_endpoints.setdefault(session.user, {})
                 endpoints.pop(address, None)
-                endpoints[address] = time.monotonic()
+                endpoints[address] = session.id
                 while len(endpoints) > self.max_feed_endpoints:
                     endpoints.pop(next(iter(endpoints)))
             self.log.note(f"UDP feed attached for {session.user} from source address {peer}")
@@ -2818,7 +2941,13 @@ class ArenaServer:
         """Send current display snapshots. No caller relies on delivery or ordering."""
         if self._udp_socket is None:
             return
-        for snapshot in self.arena.feed_snapshots(now):
+        snapshots = self.arena.feed_snapshots(now)
+        live_match_ids = {snapshot["match"] for snapshot in snapshots}
+        with self._udp_lock:
+            for match_id in list(self._feed_seq):
+                if match_id not in live_match_ids:
+                    self._feed_seq.pop(match_id, None)
+        for snapshot in snapshots:
             players = snapshot["players"]
             targets = self._feed_targets([player["user"] for player in players])
             if not targets:

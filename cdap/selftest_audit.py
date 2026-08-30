@@ -15,11 +15,95 @@ from types import SimpleNamespace
 from .judge.profiler import judge_record
 from .judge.runner import load_solution
 from .protocol import Message, WireLog
-from .server import Job, JobQueue, Session, _ClientHandler, _is_loopback_host
+from .server import (
+    Arena,
+    ArenaServer,
+    Job,
+    JobQueue,
+    Match,
+    MatchState,
+    Session,
+    State,
+    Submission,
+    _ClientHandler,
+    _is_loopback_host,
+)
 from .status import Status, Verdict
 
 
 class AuditRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _bare_arena_with_players():
+        arena = Arena.__new__(Arena)
+        arena._lock = threading.RLock()
+        arena.log = WireLog(stream=io.StringIO(), use_unicode=False)
+        arena.submissions = {}
+        arena.matches = {}
+        players = []
+        for index, user in enumerate(("alice", "bob"), start=1):
+            session = Session(f"c-{index}", SimpleNamespace(), arena.log)
+            session.user = user
+            session.state = State.IN_MATCH
+            session.match_id = "m-1"
+            players.append(session)
+        arena.sessions = {session.id: session for session in players}
+        match = Match(
+            id="m-1", problem_id="max-subarray",
+            session_ids=[session.id for session in players],
+            active_session_ids={session.id for session in players},
+            duration_s=30, created_at=0, starts_at=0,
+            state=MatchState.RUNNING, deadline=30,
+        )
+        arena.matches[match.id] = match
+        return arena, match, players
+
+    def test_earliest_valid_submission_wins_not_first_worker(self) -> None:
+        arena, match, players = self._bare_arena_with_players()
+        earlier = Submission("s-1", players[0].id, "alice", match.id,
+                             "max-subarray", "python", "", 1.0)
+        later = Submission("s-2", players[1].id, "bob", match.id,
+                           "max-subarray", "python", "", 2.0,
+                           verdict={"verdict": int(Verdict.ACCEPTED)})
+        arena.submissions = {earlier.id: earlier, later.id: later}
+        match.submissions = [earlier.id, later.id]
+
+        arena.resolve_match_after_verdict(match)
+        self.assertEqual(MatchState.DRAINING, match.state)
+        earlier.verdict = {"verdict": int(Verdict.WRONG_ANSWER)}
+        arena.resolve_match_after_verdict(match)
+        self.assertEqual(MatchState.ENDED, match.state)
+        self.assertEqual("bob", match.winner)
+
+    def test_udp_targets_are_bound_to_live_session_ids(self) -> None:
+        server = ArenaServer.__new__(ArenaServer)
+        server._udp_lock = threading.Lock()
+        server._feed_endpoints = {"alice": {("127.0.0.1", 5051): "c-1"}}
+        server.arena = SimpleNamespace(feed_session_is_alive=lambda session_id: session_id == "c-1")
+        self.assertEqual({("127.0.0.1", 5051)}, server._feed_targets(["alice"]))
+
+    def test_forfeiter_and_winner_both_leave_match_state(self) -> None:
+        arena, match, players = self._bare_arena_with_players()
+        arena.forfeit(players[0])
+        self.assertEqual(MatchState.ENDED, match.state)
+        self.assertEqual("bob", match.winner)
+        self.assertEqual(State.IDLE, players[0].state)
+        self.assertEqual(State.IDLE, players[1].state)
+        self.assertEqual("MATCH_END", players[0].outbox.get_nowait().event)
+        self.assertEqual("MATCH_END", players[1].outbox.get_nowait().event)
+
+    def test_deadline_drains_pending_submission(self) -> None:
+        arena, match, players = self._bare_arena_with_players()
+        pending = Submission("s-1", players[0].id, "alice", match.id,
+                             "max-subarray", "python", "", 1.0)
+        arena.submissions[pending.id] = pending
+        match.submissions = [pending.id]
+        arena.expire_matches(31.0)
+        self.assertEqual(MatchState.DRAINING, match.state)
+        pending.verdict = {"verdict": int(Verdict.ACCEPTED)}
+        arena.resolve_match_after_verdict(match)
+        self.assertEqual(MatchState.ENDED, match.state)
+        self.assertEqual("alice", match.winner)
+
     def test_performance_policy_accepts_complete_hidden_evidence(self) -> None:
         record = {
             "outcome": "tests_passed",
@@ -66,6 +150,15 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertNotIn("bearer-secret", text)
         self.assertIn("<redacted>", text)
         self.assertIn("\\x1b", text)
+
+    def test_wire_log_never_prints_submission_source(self) -> None:
+        stream = io.StringIO()
+        log = WireLog(stream=stream, verbose=True, use_unicode=False)
+        source = "def solve(nums):\n    return 987654321\n"
+        log.received(Message.request("SUBMIT", body=source, seq=1))
+        text = stream.getvalue()
+        self.assertNotIn("987654321", text)
+        self.assertIn("<source redacted sha256=", text)
 
     def test_bounded_queue_never_over_reserves(self) -> None:
         jobs = JobQueue(max_pending=1)

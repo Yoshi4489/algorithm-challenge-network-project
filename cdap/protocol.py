@@ -81,7 +81,9 @@ LOG_BODY_PREVIEW = 96
 
 # Values in these fields are bearer credentials or passwords.  Wire logging is a
 # teaching aid, never an excuse to put secrets in terminal history or recordings.
-_SENSITIVE_FIELDS = frozenset({"pass", "password", "token", "worker-token", "authorization"})
+_SENSITIVE_FIELDS = frozenset({
+    "pass", "password", "token", "worker-token", "authorization", "source",
+})
 
 
 def _safe_log_text(value) -> str:
@@ -777,6 +779,9 @@ class WireLog:
 
     def _body_line(self, message) -> str:
         """One truncated preview line. The full length is always stated."""
+        if message.kind is Kind.REQUEST and message.method == "SUBMIT":
+            digest = hashlib.sha256(message.body).hexdigest()[:12]
+            return f'        body[{len(message.body)}] "<source redacted sha256={digest}>"'
         text = message.text()
         # Authentication bodies are JSON.  Preserve useful structure while ensuring a
         # password never reaches stdout; non-JSON bodies are still safely escaped below.
