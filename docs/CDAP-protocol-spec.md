@@ -12,12 +12,12 @@ status code/status phrase, state machine และผลการทดสอบ
 ## 1. วัตถุประสงค์ของ Application
 
 CDAP เป็นสนามแข่งขันเขียนโปรแกรมแบบ real-time ผู้เล่นสองคนได้รับโจทย์เดียวกันและส่ง
-Python source code ไปยัง Arena Server จากนั้น Judge Worker จะตรวจ correctness และวัด
-time/space complexity จากหลาย input sizes เพื่อตรวจตาม complexity contract ของโจทย์
+Python source code ไปยัง Arena Server จากนั้น Judge Worker จะตรวจ correctness บน hidden
+stress cases และวัด CPU time, wall time และ auxiliary memory เทียบกับ resource contract
 
-จุดแตกต่างสำคัญคือ solution ที่ตอบถูกแต่ช้ากว่า contract จะไม่ผ่าน เช่นโจทย์กำหนด
-`required_time: O(n)` แต่ระบบวัดได้ `O(n^2)` จะได้รับ verdict
-`606 TIME_COMPLEXITY_VIOLATION` การส่งข้อมูลสำเร็จจึงไม่เท่ากับ algorithm ผ่านการตัดสิน
+โหมดแข่งขันเริ่มต้นคือ `performance` ซึ่งใช้ค่าที่วัดโดยตรงและ oracle ที่เชื่อถือได้
+ส่วน `complexity-demo` ใช้การ fit Big-O เพื่อสาธิต `606 TIME_COMPLEXITY_VIOLATION`
+แต่ไม่ใช้เป็นค่าเริ่มต้น เพราะ O(n) กับ O(n log n) แยกด้วย timing curve ได้ไม่เสถียร
 
 ลักษณะของระบบ:
 
@@ -89,6 +89,11 @@ Request มี `Seq` เพิ่มขึ้นทีละหนึ่ง แ�
 `Event-Id` และ **ไม่มี `Seq`** ทำให้ reader thread route response ไปยัง caller ที่รออยู่
 และ route event ไปยัง event handler โดยไม่ต้องเดา
 
+Request ที่เปลี่ยน state รองรับ header `Request-Id` แบบ optional เมื่อ retry เนื้อหาเดิม
+server replay response เดิมพร้อม `Idempotent-Replay: true`; หากใช้ ID เดิมกับเนื้อหาอื่นตอบ
+`409 IDEMPOTENCY_CONFLICT` Client ตรวจช่องว่างของ `Event-Id` และเรียก `GET_STATE` เพื่อ
+resynchronize โดยไม่ block reader thread
+
 ### 4.1 ตัวอย่าง Submission
 
 ```text
@@ -135,6 +140,7 @@ Verdict ภายใน event ไม่ใช่ protocol response status
 | `HELLO` | `200 OK` + capability body | `426 VERSION_UNSUPPORTED` |
 | `REGISTER {user,pass}` | `201 REGISTERED` | `400 BAD_REQUEST`, `409 USER_EXISTS` |
 | `LOGIN {user,pass}` | `200 OK` + token | `401 AUTH_FAILED` |
+| `GET_STATE` | `200 OK` + authoritative state/history | `401 AUTH_FAILED` |
 | `LOGOUT` | `204 NO_CONTENT` | `401 AUTH_FAILED` |
 
 Unknown user และ wrong password ใช้ `401 AUTH_FAILED` เหมือนกันเพื่อไม่ให้ LOGIN เป็น
@@ -187,13 +193,13 @@ CDAP แยก protocol status `1xx-5xx` ออกจาก judge verdict `6xx`
 | 201 | `CREATED`, `REGISTERED` |
 | 202 | `ACCEPTED`, `QUEUED` |
 | 204 | `NO_CONTENT` |
-| 400 | `BAD_REQUEST` |
+| 400 | `BAD_REQUEST`, `INVALID_SOURCE_ENCODING` |
 | 401 | `AUTH_FAILED` |
 | 403 | `FORBIDDEN`, `NOT_IN_MATCH`, `NOT_IN_ROOM`, `WRONG_STATE` |
 | 404 | `NOT_FOUND`, `ROOM_NOT_FOUND`, `SUBMISSION_NOT_FOUND` |
 | 405 | `METHOD_NOT_ALLOWED` |
 | 408 | `REQUEST_TIMEOUT` |
-| 409 | `CONFLICT`, `ALREADY_QUEUED`, `NOT_QUEUED`, `ROOM_FULL`, `USER_EXISTS` |
+| 409 | `CONFLICT`, `ALREADY_QUEUED`, `NOT_QUEUED`, `ROOM_FULL`, `USER_EXISTS`, `IDEMPOTENCY_CONFLICT` |
 | 410 | `MATCH_ENDED` |
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 415 | `UNSUPPORTED_LANGUAGE` |
@@ -207,14 +213,14 @@ CDAP แยก protocol status `1xx-5xx` ออกจาก judge verdict `6xx`
 
 | Code | Phrase | ความหมาย |
 |---|---|---|
-| 600 | `ACCEPTED` | ถูกต้องและผ่าน complexity contract |
+| 600 | `ACCEPTED` | ถูกต้องและผ่าน authoritative performance limits |
 | 601 | `WRONG_ANSWER` | output value ผิด |
 | 602 | `TIME_LIMIT_EXCEEDED` | parent kill เมื่อเกิน wall-clock |
 | 603 | `MEMORY_LIMIT_EXCEEDED` | memory เกิน absolute cap |
 | 604 | `COMPILE_ERROR` | parse/compile ไม่สำเร็จ |
 | 605 | `RUNTIME_ERROR` | exception ระหว่างทำงาน |
-| 606 | `TIME_COMPLEXITY_VIOLATION` | ถูกแต่ growth ช้ากว่า contract |
-| 607 | `SPACE_COMPLEXITY_VIOLATION` | auxiliary-space growth เกิน contract |
+| 606 | `TIME_COMPLEXITY_VIOLATION` | demo policy infer time growth เกิน contract |
+| 607 | `SPACE_COMPLEXITY_VIOLATION` | demo policy infer auxiliary-space growth เกิน contract |
 | 608 | `OUTPUT_FORMAT_ERROR` | value เท่ากันแต่ type/shape ผิด |
 | 609 | `SANDBOX_VIOLATION` | AST guard ปฏิเสธ operation |
 | 611 | `INDETERMINATE_COMPLEXITY` | ไม่มี model ที่ fit อย่างน่าเชื่อถือ |
@@ -251,6 +257,26 @@ machine ทดสอบจาก wire ได้จริง
 
 ## 9. Complexity Measurement
 
+### Default Policy - Performance Limits
+
+ค่าเริ่มต้นของ Arena คือ `--judge-policy performance` แต่ละโจทย์กำหนด hidden sizes ขนาดใหญ่
+และ trusted oracle ทุก size โหลด module ใหม่เพื่อกัน state/cache จากรอบก่อน สร้าง input และ
+expected result นอกช่วงจับเวลา แล้ววัดเฉพาะ contestant function ด้วย CPU clock และ wall clock
+พร้อมตรวจ output value/type/shape ทุกครั้ง
+
+ถ้ารอบแรกอยู่ในช่วง ±10% ของ limit ระบบรันรวมสามครั้งแล้วใช้ median เพื่อลดผลจาก scheduler
+ส่วน auxiliary memory วัดแยกด้วย `tracemalloc` ที่ size ใหญ่สุดเพื่อไม่ให้ tracing overhead
+ปนกับเวลาที่ใช้ตัดสิน หลักฐานใน verdict ได้แก่ `decision_basis`, `policy_version`, `sizes`,
+`trials`, `cpu_ms`, `wall_ms`, per-case timings, `peak_aux_kb` และ limits ที่ใช้เปรียบเทียบ
+
+ผลลัพธ์ผิดได้ `601`; เกิน time ได้ `602`; เกิน memory ได้ `603`; record ไม่สมบูรณ์ได้ `612`
+การ fit Big-O ไม่สามารถเปลี่ยนผลการแข่งขันใน policy นี้ จึงแก้กรณี submit O(n log n) เดิมซ้ำ
+แล้วบางครั้งได้ `606` บางครั้งผ่าน
+
+### Optional Policy - Complexity Demo
+
+เปิดด้วย `--judge-policy complexity-demo` เมื่อต้องการทดลอง classification ต่อไปนี้
+
 ### Method A - Wall-Clock Regression
 
 รันหก input sizes, warm-up หนึ่งครั้ง, วัดซ้ำห้าครั้งและใช้ค่าต่ำสุดเพื่อลด one-sided
@@ -264,7 +290,7 @@ timing noise จาก scheduling ใช้ least squares through origin แล�
 CPython 3.14.3 เครื่องนี้คืน count เป็นศูนย์แบบ silent จึงห้ามใช้ mechanism ที่ไม่ผ่าน
 non-zero, reproducible และ scaling checks
 
-### Decision Policy
+### Decision Policy (Complexity Demo Only)
 
 - `margin >= 1.15`: high confidence
 - `margin < 1.15`: เลือก class ที่ถูกกว่าและระบุ low confidence
@@ -272,6 +298,7 @@ non-zero, reproducible และ scaling checks
 - Method A เป็น authority; Method B เป็น second opinion และรายงาน disagreement
 
 Policy เลือกเข้าข้างผู้เล่นเมื่อ ambiguous เพราะ false `606` ร้ายแรงกว่า borderline accept
+อย่างไรก็ตาม policy นี้เป็นเครื่องมือสาธิต/วิเคราะห์ ไม่ใช่ค่าเริ่มต้นของการแข่งขัน
 
 ## 10. Sandbox Backends
 

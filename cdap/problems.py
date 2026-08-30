@@ -111,11 +111,12 @@ def within_contract(inferred: str, required: str) -> bool:
 class Contract:
     """What a solution must satisfy beyond being correct.
 
-    The two limits are per-run guards and belong to a different question than the two
-    complexity classes. ``time_limit_ms`` catches a solution that hangs on one input
-    (``602 TIME_LIMIT_EXCEEDED``); ``required_time`` catches one that works fine on small
-    input and dies on large (``606 TIME_COMPLEXITY_VIOLATION``). A solution can pass
-    either check and fail the other, which is exactly why both exist.
+    The numeric limits are authoritative in the default performance policy:
+    ``time_limit_ms`` catches a solution that exceeds the hidden stress budget
+    (``602 TIME_LIMIT_EXCEEDED``). The class fields state the intended algorithm and are
+    enforced only by the optional ``complexity-demo`` policy, where an empirical mismatch
+    can produce ``606``/``607``. Keeping those purposes explicit prevents a noisy class fit
+    from overriding an otherwise valid competition result.
     """
 
     required_time: str

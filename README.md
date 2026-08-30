@@ -1,13 +1,15 @@
 # CDAP — Code Duel Arena Protocol
 
-A real-time competitive programming arena where the server judges submissions not just for
-**correctness**, but for whether they honor a declared **complexity contract**.
+A real-time competitive programming arena with correctness tests, deterministic hidden stress
+cases, explicit CPU/wall/memory limits, asynchronous judge workers, and an optional empirical
+complexity laboratory.
 
-Every problem ships with a contract like `required_time: O(n)`, `required_space: O(1)`. The
-server runs your submission at six input sizes, measures how the runtime scales, infers the
-actual complexity class, and rejects a correct-but-too-slow solution with its own verdict:
-`606 TIME_COMPLEXITY_VIOLATION`. On LeetCode, an O(n²) solution that passes the tests is
-accepted. Here it is not.
+The arena defaults to `--judge-policy performance`: generated hidden cases are checked by a
+trusted oracle, contestant CPU/wall time and peak auxiliary memory are measured, and only those
+declared limits decide the match. This fixes the former false/repeat-dependent `606` behavior for
+close classes such as O(n) versus O(n log n). The original curve-fitting experiment remains
+available as `--judge-policy complexity-demo`; in that teaching mode it may return
+`606 TIME_COMPLEXITY_VIOLATION`, but it is no longer the default competitive decision.
 
 ---
 
@@ -24,8 +26,10 @@ Programming) ประกอบด้วย 3 ส่วนที่ต้อง�
 
 **ตัว application** คือสนามแข่งเขียนโปรแกรมแบบ real-time: ผู้เล่นถูกจับคู่ (matchmaking)
 ได้รับโจทย์อัลกอริทึมข้อเดียวกัน แล้วส่ง code เข้ามา server จะ compile รัน test cases
-แล้ว **วัด time complexity และ memory usage จริง** เพื่อตรวจว่าตรงตาม contract ของโจทย์หรือไม่
-ถ้าคำตอบถูกแต่ช้าเกินกำหนด จะได้ verdict `606 TIME_COMPLEXITY_VIOLATION`
+แล้วตรวจ hidden stress cases พร้อมวัด CPU time, wall time และ peak auxiliary memory เทียบกับ
+ขีดจำกัดที่ประกาศไว้ ส่วนการ fit Big-O (`606 TIME_COMPLEXITY_VIOLATION`) ยังใช้ได้ในโหมด
+`complexity-demo` เพื่อการทดลอง แต่ไม่ใช้ตัดสินการแข่งขันตามค่าเริ่มต้น เพราะ O(n) กับ
+O(n log n) ใกล้กันจน timing noise ทำให้ผล submit ซ้ำเปลี่ยนได้
 
 **ชื่อ protocol: CDAP (Code Duel Arena Protocol) เวอร์ชัน `CDAP/1.0`**
 
@@ -57,19 +61,24 @@ python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w1 --token demo
 python -m cdap.judge.worker --arena 127.0.0.1:5050 --id w2 --token demo
 
 # Terminal 4 — player, compact game view
-python -m cdap.client --host 127.0.0.1 --user alice
+python -m cdap.client --host 127.0.0.1 --user alice --pass 1234
 
 # Terminal 5 — same player, UDP live-feed pane only
-python -m cdap.client --host 127.0.0.1 --user alice --feed-only
+python -m cdap.client --host 127.0.0.1 --user alice --pass 1234 --feed-only
 
 # Terminal 6 — opponent
-python -m cdap.client --host 127.0.0.1 --user bob
+python -m cdap.client --host 127.0.0.1 --user bob --pass 1234
 ```
 
 Running the client twice for one player is deliberate: window 4 is the compact game view,
 while window 5 shows **only** raw UDP datagrams. Add `--wire` to window 4 when demonstrating
 the full TCP and UDP transcript. The server always prints every protocol message with its status
 code and phrase.
+
+The client defaults to password `1234`. On the first run, `--pass VALUE` registers `VALUE` as
+that account's password; later runs authenticate against the stored verifier and do not reset it.
+The wire protocol has a `Lang` header, but this implementation currently advertises and accepts
+only `python`; adding another language requires a corresponding isolated runner/backend.
 
 Requires **Python 3.9+** (3.14 tested). No third-party packages needed. `psutil` and Docker
 are optional — see [Sandbox](#sandbox).
@@ -101,6 +110,17 @@ re-parses each one; verifies a `Body-SHA256` and then breaks it; proves a `606` 
 a response status; round-trips a UDP datagram through the percent-encoding codec and drops a
 stale `seq`; and finally writes **two frames in a single `sendall()`** over a loopback socket to
 show the reader finding the boundary in a byte stream that has none of its own.
+
+Run the remaining regressions before release. The performance check intentionally executes the
+large hidden cases and proves the formerly rejected O(n log n) sample is accepted by the default
+policy:
+
+```bash
+python -m cdap.selftest_client
+python -m cdap.selftest_audit
+python -m cdap.selftest_performance
+python -m cdap.problems
+```
 
 ---
 
@@ -156,7 +176,12 @@ frame itself: `Seq` present → hand to the blocked caller; `EVENT` → dispatch
 handler. No guessing, no ambiguity.
 
 Common headers: `Seq`, `Session`, `Match`, `Submission`, `Content-Length`, `Content-Type`,
-`Body-SHA256`, `Detail`.
+`Body-SHA256`, `Request-Id`, `Event-Id`, `Detail`.
+
+State-changing requests may carry an optional `Request-Id`. The server stores a bounded
+process-lifetime response ledger per user: retrying identical content replays the original
+response with `Idempotent-Replay: true`; reusing the ID for different content returns
+`409 IDEMPOTENCY_CONFLICT`. This is backward-compatible with clients that omit the header.
 
 ### Method catalogue
 
@@ -167,6 +192,7 @@ Common headers: `Seq`, `Session`, `Match`, `Submission`, `Content-Length`, `Cont
 | `HELLO` | – | `200 OK` + `Server`, `Session` | `426 VERSION_UNSUPPORTED` |
 | `REGISTER` | `{user,pass}` | `201 REGISTERED` | `409 USER_EXISTS`, `400 BAD_REQUEST` |
 | `LOGIN` | `{user,pass}` | `200 OK` + `Session`, `Token` | `401 AUTH_FAILED` |
+| `GET_STATE` | – | `200 OK` + authoritative state/history | `401 AUTH_FAILED` |
 | `LOGOUT` | – | `204 NO_CONTENT` | `401 AUTH_FAILED` |
 
 `HELLO`'s body advertises what the arena can do — protocol version, problem list, match
@@ -224,8 +250,12 @@ raw source as the body → `202 ACCEPTED` + `Submission`, `Queue-Pos`. Errors: `
 `422 BODY_HASH_MISMATCH`, `429 SUBMIT_COOLDOWN`, `503 JUDGE_UNAVAILABLE`.
 Also `GET_SUBMISSION {submission}` → `200 OK` + verdict JSON when the judge is done,
 `202 ACCEPTED` + `Stage` while it is still running, `404 SUBMISSION_NOT_FOUND`, or
-`403 FORBIDDEN` for someone else's submission — **403, not 404**, because pretending another
-player's submission does not exist would be a lie the client could detect by ID collision.
+`403 FORBIDDEN` for someone else's submission. Ownership is checked by authenticated user,
+not connection ID, so a reconnected player can still retrieve their own result.
+
+The client detects a missing `Event-Id`, schedules `GET_STATE` on its agent thread, and ignores
+stale snapshots. A bounded outbox discards progress events before `VERDICT`/`MATCH_END`; any
+discard creates a visible sequence gap instead of silently corrupting client state.
 
 Two details in `SUBMIT` that the checks' *order* decides:
 
@@ -265,13 +295,13 @@ HTTP APIs make constantly.
 | `201` | `CREATED`, `REGISTERED` |
 | `202` | `ACCEPTED`, `QUEUED` |
 | `204` | `NO_CONTENT` |
-| `400` | `BAD_REQUEST` |
+| `400` | `BAD_REQUEST`, `INVALID_SOURCE_ENCODING` |
 | `401` | `AUTH_FAILED` |
 | `403` | `FORBIDDEN`, `NOT_IN_MATCH`, `NOT_IN_ROOM` |
 | `404` | `NOT_FOUND`, `ROOM_NOT_FOUND` |
 | `405` | `METHOD_NOT_ALLOWED` |
 | `408` | `REQUEST_TIMEOUT` |
-| `409` | `CONFLICT`, `ALREADY_QUEUED`, `NOT_QUEUED`, `ROOM_FULL`, `USER_EXISTS` |
+| `409` | `CONFLICT`, `ALREADY_QUEUED`, `NOT_QUEUED`, `ROOM_FULL`, `USER_EXISTS`, `IDEMPOTENCY_CONFLICT` |
 | `410` | `MATCH_ENDED` |
 | `413` | `PAYLOAD_TOO_LARGE` |
 | `415` | `UNSUPPORTED_LANGUAGE` |
@@ -289,14 +319,14 @@ HTTP reason phrases do.
 
 | Code | Phrase | Meaning |
 |---|---|---|
-| `600` | `ACCEPTED` | Correct *and* within the complexity contract |
+| `600` | `ACCEPTED` | Correct and within authoritative performance limits |
 | `601` | `WRONG_ANSWER` | Output mismatch |
 | `602` | `TIME_LIMIT_EXCEEDED` | Wall-clock kill |
 | `603` | `MEMORY_LIMIT_EXCEEDED` | Peak memory over cap |
 | `604` | `COMPILE_ERROR` | Failed to parse/compile |
 | `605` | `RUNTIME_ERROR` | Raised an exception |
-| `606` | `TIME_COMPLEXITY_VIOLATION` | Correct, but scales worse than the contract |
-| `607` | `SPACE_COMPLEXITY_VIOLATION` | Correct, but uses more auxiliary space than allowed |
+| `606` | `TIME_COMPLEXITY_VIOLATION` | Demo policy inferred worse time growth than the contract |
+| `607` | `SPACE_COMPLEXITY_VIOLATION` | Demo policy inferred worse auxiliary-space growth |
 | `608` | `OUTPUT_FORMAT_ERROR` | Right value, wrong shape |
 | `609` | `SANDBOX_VIOLATION` | Attempted a forbidden import or syscall |
 | `611` | `INDETERMINATE_COMPLEXITY` | Measurements would not fit any model confidently |
@@ -372,8 +402,25 @@ current state — which makes the state machine itself demonstrable.
 
 ## The complexity profiler
 
-Two independent methods, deliberately, because comparing them *is* the project's research
-contribution.
+There are now two explicit policies with different purposes.
+
+**Default: `performance`.** Each problem declares three large hidden sizes and a trusted oracle.
+Every case loads fresh module state, builds input outside the timer, checks exact value *and*
+output shape, and records contestant CPU/wall time. If the first result is within ±10% of a
+limit, three trials are run and the median decides. `tracemalloc` measures the largest case
+separately so memory instrumentation cannot inflate authoritative time. The verdict evidence is:
+
+- `decision_basis`, `policy_version`, `sizes`, and number of `trials`;
+- aggregate `cpu_ms`, `wall_ms`, `time_limit_ms`, and `wall_limit_ms`;
+- per-case CPU/wall samples and `peak_aux_kb` versus `mem_limit_kb`.
+
+This policy does not claim that a noisy timing curve can prove a Big-O class. A correct O(n log n)
+solution may win when it stays inside the declared resource limits; a slow implementation fails
+with `602`/`603` based on direct measurements, not a scheduler-dependent `606`.
+
+**Optional: `complexity-demo`.** Two independent inference methods remain available because
+comparing them is the project's measurement experiment. Start the arena with
+`--judge-policy complexity-demo`, or use the standalone profiler, when demonstrating `606`/`607`.
 
 ### Method A — wall-clock regression (statistical, general)
 
@@ -421,7 +468,7 @@ loglog_slope = least-squares slope of (log n, log y)     # reported as a sanity 
 Written by hand in pure stdlib — no numpy — so the math stays visible in the source and can be
 explained aloud.
 
-**Decision policy.** `margin ≥ 1.15` → confident. `margin < 1.15` → ambiguous, so report the
+**Complexity-demo decision policy.** `margin ≥ 1.15` → confident. `margin < 1.15` → ambiguous, so report the
 **cheaper** of the two tied classes and mark `confidence: low`. `best rel_rmse > 0.35` →
 `611 INDETERMINATE_COMPLEXITY`.
 
@@ -429,23 +476,23 @@ When ambiguous, the profiler **favours the contestant**. A false `606` accuses s
 having written a worse algorithm than they actually did; a false accept merely lets a borderline
 solution through. Asymmetric costs justify an asymmetric policy.
 
-**Combining the two.** Method A is authoritative, because the contract is about real time. When
-the two disagree the verdict reports both and sets `methods_disagree: true`.
+**Combining the two in demo mode.** Method A is authoritative for the empirical-classification
+experiment. When the two disagree the verdict reports both and sets `methods_disagree: true`.
 
 **Space.** `tracemalloc`: snapshot after building the input, `reset_peak()`, run, then
 `aux = peak − before`. Subtracting the input's own footprint is what makes it *auxiliary* space
 — without that, `O(1)` space would be unmeasurable, since the input alone is `O(n)`.
 
-**Contract check.** Classes rank `O(1) < O(log n) < O(n) < O(n log n) < O(n²) < O(n³) < O(2ⁿ)`;
+**Demo-mode contract check.** Classes rank `O(1) < O(log n) < O(n) < O(n log n) < O(n²) < O(n³) < O(2ⁿ)`;
 a submission passes iff `rank(inferred) ≤ rank(required)`.
 
 ### Known limitations — stated, not hidden
 
 These are documented deliberately. Two of them are findings, not defects:
 
-1. **O(n) vs O(n log n) cannot be reliably separated** at these input sizes — the log-log
-   slopes are 1.00 vs ~1.10, well inside measurement noise. The profiler says so via
-   `confidence: low` rather than pretending to a precision it does not have.
+1. **O(n) vs O(n log n) cannot be reliably separated** at the demo ladder sizes — the log-log
+   slopes are 1.00 vs ~1.10, well inside measurement noise. This is why empirical fitting is
+   advisory/teaching-only and the server defaults to direct performance limits.
 2. **Method B is blind to C-implemented builtins.** Opcode counting only sees Python-level
    bytecode, so work inside `list.sort()`, `sum()`, or `str.join()` registers as a single
    `CALL`. A Timsort-based O(n log n) solution therefore looks near-linear under Method B.
@@ -518,11 +565,14 @@ cdap/judge/backends.py          Backend interface + SubprocessBackend + DockerBa
 cdap/judge/sandbox.py           AST guard (shared by both backends)
 cdap/judge/runner.py            in-child harness: correctness / time / ops / space
 cdap/judge/profiler.py          model fitter + decision policy
+solution.py                     optimized O(n)/O(1) maximum-subarray submission
 samples/                        known-complexity reference solutions + evil_*.py
 experiments/                    the two result-producing scripts
 docs/CDAP-protocol-spec.md      → export to PDF (deliverable 1)
+docs/SUBMISSION_GUIDE_TH.md     files to submit + Thai code/status/measurement guide
 docs/threat-model.md            sandbox threat model + stated limitations
 docs/slides-outline.md          timings for the ≤15 min video (deliverable 3)
+REVIEW_AUDIT_2.md               root-cause review, edge cases, and upgrade roadmap
 ```
 
 Four problems, each with an adversarial generator: `max-subarray` (Kadane, O(n)/O(1)),
@@ -547,6 +597,7 @@ Built in phases, each ending in a demoable result and its own commit.
 | 7 | UDP feed, stale-drop, `--feed-only`, `--no-udp` | ✅ done |
 | 8 | `DockerBackend` | ✅ done |
 | 9 | Both experiments, three bilingual docs | ✅ done |
+| 10 | Fair performance policy, deterministic winner, retry/recovery protocol | ✅ done |
 
 **What runs today:** the complete project: the capability probe (`python -m cdap.capabilities`), the wire layer
 self-test (`python -m cdap.selftest_protocol`), which frames all three message kinds, verifies
@@ -559,7 +610,7 @@ workers, long-poll dispatch, heartbeat leases, job reclamation, and truthful bac
 python -m cdap.problems                                     # problem catalogue self-check
 python -m cdap.judge.sandbox samples/evil_socket.py          # AST guard verdict for one file
 python -m cdap.judge.backends samples/max_subarray_on2.py    # run + measure one submission
-python -m cdap.judge.profiler samples/max_subarray_on2.py    # measure + judge -> 606
+python -m cdap.judge.profiler samples/max_subarray_on2.py    # complexity-demo -> 606
 python -m cdap.judge.profiler samples/fib_naive.py fib       # naive recursion -> 606
 python -m cdap.server --tcp-port 5050 --countdown 1           # terminal 1
 python -m cdap.client --user alice --queue --submit samples/max_subarray_on.py --once
@@ -579,7 +630,8 @@ counts, peak auxiliary memory. `cdap.judge.profiler` is the decision: it fits th
 against the model ladder and turns it into a `6xx` verdict, so the classes named in `samples/`
 are now measured *and* judged.
 
-`samples/` covers the verdict matrix, each file's docstring naming its expected verdict:
+In `complexity-demo`, `samples/` covers the empirical verdict matrix, each file's docstring
+naming its expected verdict:
 `600` `max_subarray_on.py` · `601` `max_subarray_wrong.py` · `602` `max_subarray_busy_loop.py` ·
 `603` `max_subarray_memory.py` · `604` `max_subarray_syntax_error.py` ·
 `605` `max_subarray_runtime_error.py` · `606` `max_subarray_on2.py`, `fib_naive.py` ·
