@@ -63,7 +63,7 @@ The simplest client command includes the account details. On its first connectio
 automatically sends `REGISTER`, then `LOGIN`; on later connections it simply logs in:
 
 ```powershell
-py -3.14 -m cdap.client --host 127.0.0.1 --user alice --pass 1234
+py -3.14 -m cdap.client --host 127.0.0.1 --user Yoshi --pass 1234
 ```
 
 Expected wire results:
