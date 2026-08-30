@@ -115,7 +115,7 @@ from ..protocol import (
 from ..status import Status, Verdict, describe_status, is_success
 from .backends import make_backend
 from .profiler import judge_record
-from .runner import run_budget_ms
+from .runner import PERFORMANCE_POLICY, performance_run_budget_ms, run_budget_ms
 
 #: How long the arena is asked to hold a ``WORKER_PULL`` open before answering ``204``.
 #:
@@ -700,10 +700,16 @@ class JudgeWorker:
             "guard": self.guard,
             "profile": self.profile,
             "opcode_counter": counter,
+            "policy": job.get("policy", "complexity-demo"),
         }
 
         try:
-            run = self.backend.run(payload, time_limit_ms=run_budget_ms(limit_ms))
+            budget_ms = (
+                performance_run_budget_ms(limit_ms)
+                if payload["policy"] == PERFORMANCE_POLICY
+                else run_budget_ms(limit_ms)
+            )
+            run = self.backend.run(payload, time_limit_ms=budget_ms)
         except Exception as exc:                          # noqa: BLE001 - see the docstring
             self.log.note(f"backend failed on {submission_id}: {exc!r}")
             return _judge_error(f"the judge backend failed: {exc!r}"), self.backend.name, 0.0

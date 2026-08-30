@@ -454,6 +454,7 @@ _OUTCOME_VERDICT = {
     "wrong_answer": Verdict.WRONG_ANSWER,
     "output_format_error": Verdict.OUTPUT_FORMAT_ERROR,
     "time_limit_exceeded": Verdict.TIME_LIMIT_EXCEEDED,
+    "memory_limit_exceeded": Verdict.MEMORY_LIMIT_EXCEEDED,
     "judge_error": Verdict.JUDGE_ERROR,
 }
 
@@ -472,6 +473,7 @@ def judge_record(record: dict, contract: dict, outcome_hint: Optional[str] = Non
     that blew a ceiling is not worth much.
     """
     outcome = outcome_hint or record.get("outcome", "judge_error")
+    policy = record.get("judge_policy", "complexity-demo")
 
     # -- outcomes decided before any profiling happened ---------------------
     if outcome in _OUTCOME_VERDICT:
@@ -481,6 +483,23 @@ def judge_record(record: dict, contract: dict, outcome_hint: Optional[str] = Non
     if outcome != "tests_passed":
         return _verdict(Verdict.JUDGE_ERROR, record, contract,
                         detail=f"unrecognised outcome {outcome!r} from the harness")
+
+    # Production judging is based on hidden correctness plus absolute CPU/wall/memory
+    # budgets. Big-O fitting remains available as an advisory/demo tool, but timing noise
+    # can no longer turn a resubmission into a different match result.
+    if policy == "performance":
+        performance = record.get("performance", {})
+        if not performance.get("complete", False):
+            return _verdict(
+                Verdict.JUDGE_ERROR, record, contract,
+                detail="performance record is incomplete; refusing to guess",
+            )
+        return _verdict(
+            Verdict.ACCEPTED, record, contract,
+            detail=(f"hidden suite passed in {performance.get('cpu_ms', '?')}ms CPU, "
+                    f"{performance.get('wall_ms', '?')}ms wall; peak auxiliary "
+                    f"{performance.get('peak_aux_kb', '?')} KB"),
+        )
 
     # Correct, but measurement was switched off (--no-profile). Accept it and say plainly
     # that the contract was not checked, rather than implying it was.
@@ -626,7 +645,17 @@ def _verdict(code, record: dict, contract: dict, detail: str = "",
         "failures": tests.get("failures", []),
         "required_time": contract.get("required_time"),
         "required_space": contract.get("required_space"),
+        "judge_policy": record.get("judge_policy", "complexity-demo"),
     }
+
+    performance = record.get("performance")
+    if isinstance(performance, dict) and performance:
+        payload["decision_basis"] = "performance_limits"
+        payload["policy_version"] = performance.get("policy_version")
+        payload["cpu_ms"] = performance.get("cpu_ms")
+        payload["wall_ms"] = performance.get("wall_ms")
+        payload["peak_aux_kb"] = performance.get("peak_aux_kb")
+        payload["performance"] = performance
 
     if time_analysis is not None:
         payload["inferred_time"] = time_analysis["inferred"]

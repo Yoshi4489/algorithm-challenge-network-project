@@ -51,6 +51,8 @@ reach the same verdict.
 
 from __future__ import annotations
 
+import builtins
+import copy
 import json
 import math
 import sys
@@ -112,6 +114,10 @@ MAX_MEASURE_TOTAL_S = MAX_TIME_LADDER_S + MAX_OPS_LADDER_S + MAX_SPACE_LADDER_S
 #: has stopped cooperating, not the normal way a run ends.
 CHILD_REPORT_SLACK_S = 6.0
 
+PERFORMANCE_POLICY = "performance"
+COMPLEXITY_DEMO_POLICY = "complexity-demo"
+PERFORMANCE_POLICY_VERSION = "performance-v1"
+
 
 def run_budget_ms(contract_time_limit_ms: int) -> int:
     """Wall-clock budget for one whole judging run — tests *and* the measurement ladder.
@@ -136,6 +142,16 @@ def run_budget_ms(contract_time_limit_ms: int) -> int:
     spend, so in normal operation the parent's deadline is never the thing that ends a run.
     """
     return int(contract_time_limit_ms + (MAX_MEASURE_TOTAL_S + CHILD_REPORT_SLACK_S) * 1000)
+
+
+def performance_run_budget_ms(contract_time_limit_ms: int) -> int:
+    """Parent watchdog for correctness and hidden performance cases.
+
+    The contestant CPU budget remains ``contract_time_limit_ms``.  This larger wall
+    allowance covers deterministic input/oracle construction, interpreter startup and a
+    possible three-trial borderline measurement without charging those costs to the player.
+    """
+    return max(15_000, int(contract_time_limit_ms) * 4 + 7_000)
 
 
 class Timeout(Exception):
@@ -171,7 +187,12 @@ def load_solution(source: str, entry: str, guard: bool = True):
 
     # A fresh namespace per submission. __name__ is set so that a solution guarded by
     # `if __name__ == "__main__":` does not run its demo block during import.
-    namespace: Dict[str, Any] = {"__name__": "__cdap_submission__"}
+    # Give the submission a private builtins dictionary.  Mutating ``__builtins__`` must
+    # not replace the harness' own stdout/result functions in the shared child process.
+    namespace: Dict[str, Any] = {
+        "__name__": "__cdap_submission__",
+        "__builtins__": dict(vars(builtins)),
+    }
     exec(compile(source, "<submission>", "exec"), namespace)
 
     function = namespace.get(entry)
@@ -254,6 +275,143 @@ def _same_shape(got, expected) -> bool:
     if isinstance(expected, int):
         return isinstance(got, int) and not isinstance(got, bool)
     return type(got) is type(expected)
+
+
+def _performance_failure(outcome: str, detail: str, *, performance=None) -> dict:
+    result = _failed(outcome, detail)
+    if performance is not None:
+        result["performance"] = performance
+    return result
+
+
+def _run_performance_trial(source, problem, guard: bool) -> dict:
+    """Run each hidden case from fresh module state and time contestant work only."""
+    cpu_ms = 0.0
+    wall_ms = 0.0
+    cases = []
+
+    for n in problem.performance_sizes:
+        try:
+            function = load_solution(source, problem.entry, guard=guard)
+            args = problem.generate(n)
+            expected = problem.oracle(*copy.deepcopy(args))
+            cpu_started = time.process_time_ns()
+            wall_started = time.perf_counter_ns()
+            got = function(*args)
+            elapsed_wall = (time.perf_counter_ns() - wall_started) / 1_000_000.0
+            elapsed_cpu = (time.process_time_ns() - cpu_started) / 1_000_000.0
+        except BaseException as exc:                     # contestant code owns this failure
+            return {
+                "outcome": "runtime_error",
+                "detail": f"hidden performance case n={n}: {type(exc).__name__}: {exc}",
+            }
+
+        if not (_same_shape(got, expected) and got == expected):
+            return {
+                "outcome": "wrong_answer",
+                "detail": f"hidden performance case n={n} returned an incorrect result",
+            }
+
+        cpu_ms += elapsed_cpu
+        wall_ms += elapsed_wall
+        cases.append({
+            "n": n,
+            "cpu_ms": round(elapsed_cpu, 3),
+            "wall_ms": round(elapsed_wall, 3),
+        })
+
+    return {
+        "outcome": "tests_passed",
+        "cpu_ms": cpu_ms,
+        "wall_ms": wall_ms,
+        "cases": cases,
+    }
+
+
+def measure_performance(source: str, problem, guard: bool = True) -> dict:
+    """Authoritative hidden correctness, CPU, wall and auxiliary-memory gate."""
+    limit_ms = float(problem.contract.time_limit_ms)
+    wall_limit_ms = limit_ms * 1.5
+    trials = []
+
+    first = _run_performance_trial(source, problem, guard)
+    if first.get("outcome") != "tests_passed":
+        return first
+    trials.append(first)
+
+    # Repeat only in the grey band.  Fast and clearly slow submissions pay for one trial;
+    # borderline submissions get a median instead of a scheduler-dependent coin flip.
+    ratio = max(first["cpu_ms"] / limit_ms, first["wall_ms"] / wall_limit_ms)
+    if 0.9 <= ratio <= 1.1:
+        for _ in range(2):
+            repeated = _run_performance_trial(source, problem, guard)
+            if repeated.get("outcome") != "tests_passed":
+                return repeated
+            trials.append(repeated)
+
+    cpu_values = sorted(trial["cpu_ms"] for trial in trials)
+    wall_values = sorted(trial["wall_ms"] for trial in trials)
+    cpu_ms = cpu_values[len(cpu_values) // 2]
+    wall_ms = wall_values[len(wall_values) // 2]
+    performance = {
+        "policy": PERFORMANCE_POLICY,
+        "policy_version": PERFORMANCE_POLICY_VERSION,
+        "sizes": list(problem.performance_sizes),
+        "trials": len(trials),
+        "cpu_ms": round(cpu_ms, 3),
+        "wall_ms": round(wall_ms, 3),
+        "time_limit_ms": problem.contract.time_limit_ms,
+        "wall_limit_ms": round(wall_limit_ms, 3),
+        "cases": trials[len(trials) // 2]["cases"],
+    }
+
+    if cpu_ms > limit_ms or wall_ms > wall_limit_ms:
+        return _performance_failure(
+            "time_limit_exceeded",
+            f"hidden suite used {cpu_ms:.1f}ms CPU/{wall_ms:.1f}ms wall; limits are "
+            f"{limit_ms:.0f}ms CPU/{wall_limit_ms:.0f}ms wall",
+            performance=performance,
+        )
+
+    # Auxiliary memory is measured separately so tracemalloc overhead cannot inflate the
+    # authoritative time.  The largest hidden case is sufficient for the hard ceiling.
+    n = max(problem.performance_sizes)
+    try:
+        function = load_solution(source, problem.entry, guard=guard)
+        args = problem.generate(n)
+        expected = problem.oracle(*copy.deepcopy(args))
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        got = function(*args)
+        _current, peak = tracemalloc.get_traced_memory()
+    except BaseException as exc:
+        return _performance_failure(
+            "runtime_error",
+            f"hidden memory case n={n}: {type(exc).__name__}: {exc}",
+            performance=performance,
+        )
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+
+    if not (_same_shape(got, expected) and got == expected):
+        return _performance_failure(
+            "wrong_answer", f"hidden memory case n={n} returned an incorrect result",
+            performance=performance,
+        )
+
+    peak_kb = peak / 1024.0
+    performance["peak_aux_kb"] = round(peak_kb, 3)
+    if peak_kb > problem.contract.mem_limit_kb:
+        return _performance_failure(
+            "memory_limit_exceeded",
+            f"hidden suite used {peak_kb:.1f} KB auxiliary memory; limit is "
+            f"{problem.contract.mem_limit_kb} KB",
+            performance=performance,
+        )
+
+    performance["complete"] = True
+    return {"outcome": "tests_passed", "performance": performance}
 
 
 # --------------------------------------------------------------------------
@@ -663,6 +821,9 @@ def run_job(job: dict) -> dict:
     guard = job.get("guard", True)
     profile = job.get("profile", True)
     counter_name = job.get("opcode_counter", "none")
+    policy = job.get("policy", COMPLEXITY_DEMO_POLICY)
+    if policy not in (PERFORMANCE_POLICY, COMPLEXITY_DEMO_POLICY):
+        return _failed("judge_error", f"unknown judge policy {policy!r}")
 
     try:
         problem = get_problem(job["problem"])
@@ -691,6 +852,7 @@ def run_job(job: dict) -> dict:
         "guard_enabled": guard,
         "tests": tests,
         "contract": problem.contract.to_json(),
+        "judge_policy": policy,
     }
     # Used only by experiments/backend_overhead.py with the AST guard deliberately off.
     # The hostile samples record whether their attempted escape reached the OS. Ordinary
@@ -716,6 +878,15 @@ def run_job(job: dict) -> dict:
         return result
 
     result["outcome"] = "tests_passed"
+
+    if policy == PERFORMANCE_POLICY:
+        measured = measure_performance(source, problem, guard=guard)
+        result["profiled"] = False
+        result["performance"] = measured.get("performance", {})
+        if measured.get("outcome") != "tests_passed":
+            result["outcome"] = measured.get("outcome", "judge_error")
+            result["detail"] = measured.get("detail", "performance judge failed")
+        return result
 
     if not profile:
         result["profiled"] = False

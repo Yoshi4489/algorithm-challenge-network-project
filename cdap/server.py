@@ -88,7 +88,13 @@ from .protocol import (
 from .status import Status, Verdict, format_status
 from .judge.backends import DockerBackend, make_backend
 from .judge.profiler import judge_record
-from .judge.runner import run_budget_ms
+from .judge.runner import (
+    COMPLEXITY_DEMO_POLICY,
+    PERFORMANCE_POLICY,
+    PERFORMANCE_POLICY_VERSION,
+    performance_run_budget_ms,
+    run_budget_ms,
+)
 
 #: Largest source file a player may submit. Well under ``protocol.MAX_BODY_BYTES`` (1 MB)
 #: on purpose, and the difference in *handling* is the interesting part:
@@ -629,12 +635,19 @@ class LocalJudgePool:
         # cannot watch. See JUDGE_STAGES.
         self.arena.set_stage(job.submission_id, "COMPILING", worker_id=worker_id)
 
-        run = backend.run(job.payload, time_limit_ms=run_budget_ms(contract.time_limit_ms))
+        policy = job.payload.get("policy", COMPLEXITY_DEMO_POLICY)
+        budget_ms = (
+            performance_run_budget_ms(contract.time_limit_ms)
+            if policy == PERFORMANCE_POLICY
+            else run_budget_ms(contract.time_limit_ms)
+        )
+        run = backend.run(job.payload, time_limit_ms=budget_ms)
         verdict = judge_record(
             run.result or {},
             contract.to_json(),
             outcome_hint=run.outcome_hint(),
         )
+        self.arena.cache_verdict(job.submission_id, verdict)
         self.arena.record_verdict(
             job.submission_id, verdict, backend_name=run.backend,
             worker_id=worker_id, wall_ms=run.wall_ms,
@@ -675,6 +688,7 @@ class Arena:
                  problem_id: Optional[str], room_capacity: int, allow_panic: bool,
                  worker_token: str = "",
                  worker_heartbeat_ms: int = DEFAULT_WORKER_HEARTBEAT_MS,
+                 judge_policy: str = PERFORMANCE_POLICY,
                  limits: Optional[ArenaLimits] = None):
         self.log = log
         self.min_players = min_players
@@ -687,6 +701,7 @@ class Arena:
         self.allow_panic = allow_panic
         self.worker_token = worker_token
         self.worker_heartbeat_ms = max(250, int(worker_heartbeat_ms))
+        self.judge_policy = judge_policy
         self.limits = limits or ArenaLimits()
 
         self._lock = threading.RLock()
@@ -704,6 +719,7 @@ class Arena:
         self.pool: Optional[LocalJudgePool] = None
         self._failed_logins: Dict[str, deque[float]] = defaultdict(deque)
         self._registrations: Dict[str, deque[float]] = defaultdict(deque)
+        self._verdict_cache: Dict[tuple, dict] = {}
 
         self._session_counter = 0
         self._match_counter = 0
@@ -1106,11 +1122,47 @@ class Arena:
 
         return submission, position
 
+    def _verdict_cache_key(self, submission: Submission) -> tuple:
+        return (
+            submission.problem_id,
+            submission.lang,
+            hashlib.sha256(submission.source.encode("utf-8")).hexdigest(),
+            self.judge_policy,
+            PERFORMANCE_POLICY_VERSION,
+        )
+
+    def cached_verdict(self, submission: Submission) -> Optional[dict]:
+        with self._lock:
+            cached = self._verdict_cache.get(self._verdict_cache_key(submission))
+            return dict(cached) if cached is not None else None
+
+    def cache_verdict(self, submission_id: str, verdict: dict) -> None:
+        """Cache stable player outcomes; infrastructure/ambiguous results must be retried."""
+        code = int(verdict.get("verdict", int(Verdict.JUDGE_ERROR)))
+        if code in (int(Verdict.INDETERMINATE_COMPLEXITY), int(Verdict.JUDGE_ERROR)):
+            return
+        canonical = dict(verdict)
+        canonical.pop("backend", None)
+        canonical.pop("worker", None)
+        canonical.pop("judge_wall_ms", None)
+        canonical["cache_hit"] = False
+        with self._lock:
+            submission = self.submissions.get(submission_id)
+            if submission is not None:
+                self._verdict_cache[self._verdict_cache_key(submission)] = canonical
+
     def dispatch_submission(self, submission: Submission) -> int:
         """Queue an already-recorded submission for judging and announce it.
 
         Runs *after* the ``202 ACCEPTED`` has gone out. Returns the true queue position.
         """
+        cached = self.cached_verdict(submission)
+        if cached is not None:
+            self.jobs.cancel_reservation()
+            cached["cache_hit"] = True
+            self.record_verdict(submission.id, cached, backend_name="cache")
+            return 0
+
         job = Job(
             submission_id=submission.id,
             problem_id=submission.problem_id,
@@ -1120,6 +1172,7 @@ class Arena:
                 "guard": True,
                 "profile": True,
                 "opcode_counter": self.capabilities.opcode_counter_name,
+                "policy": self.judge_policy,
             },
         )
         self.jobs.put_reserved(job)
@@ -1389,6 +1442,7 @@ class Arena:
             record.lease_deadline = 0.0
             record.last_seen = time.monotonic()
 
+        self.cache_verdict(submission_id, verdict)
         accepted = self.record_verdict(
             submission_id, verdict, backend_name=backend,
             worker_id=worker_id, wall_ms=wall_ms,
@@ -2072,6 +2126,8 @@ class _ClientHandler:
                 "healthy": self.arena.judge_healthy(),
                 "remote_workers": self.arena.remote_worker_count(),
                 "opcode_counter": self.arena.capabilities.opcode_counter_name,
+                "policy": self.arena.judge_policy,
+                "policy_version": PERFORMANCE_POLICY_VERSION,
             },
         })
         return self._ok(message, Status.OK, headers={
@@ -2901,6 +2957,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "503 JUDGE_UNAVAILABLE (default: 2)")
     parser.add_argument("--backend", choices=("subprocess", "docker"), default="subprocess",
                         help="how a submission is isolated (default: subprocess)")
+    parser.add_argument(
+        "--judge-policy",
+        choices=(PERFORMANCE_POLICY, COMPLEXITY_DEMO_POLICY),
+        default=PERFORMANCE_POLICY,
+        help="authoritative performance limits, or the empirical hard-606 coursework demo",
+    )
     parser.add_argument("--allow-insecure-remote", action="store_true",
                         help="allow a non-loopback bind for a controlled demo only; requires "
                              "the Docker backend. CDAP does not provide TLS")
@@ -3006,6 +3068,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         allow_panic=args.allow_panic,
         worker_token=args.worker_token,
         worker_heartbeat_ms=args.worker_heartbeat_ms,
+        judge_policy=args.judge_policy,
         limits=ArenaLimits(
             max_users=args.max_users,
             max_submissions=args.max_submissions,
@@ -3028,6 +3091,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.note(f"backend {args.backend!r} is unavailable — falling back to {actual!r}; "
                  f"every verdict will report backend={actual}")
     log.note(f"judges: {args.judges} thread(s), backend={actual}, "
+             f"policy={arena.judge_policy}, "
              f"opcode counter={arena.capabilities.opcode_counter_name}")
     if args.judges == 0:
         log.note("no local judge threads — SUBMIT answers 503 JUDGE_UNAVAILABLE until a "

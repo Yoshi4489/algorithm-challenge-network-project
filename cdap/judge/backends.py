@@ -57,11 +57,10 @@ from .runner import RESULT_SENTINEL
 #: this only bounds a misbehaving one.
 MAX_OUTPUT_BYTES = 64 * 1024
 
-#: How long past the job's own wall-clock allowance the parent waits before killing the
-#: child tree. The child does its own per-call timing; this is the backstop for a child
-#: that has stopped cooperating entirely (a busy loop, a deadlock). The measurement ladder
-#: can legitimately take a while, so the backstop is generous and additive.
-KILL_GRACE_S = 10.0
+#: Small allowance for interpreter/container startup and final result reporting.  Callers
+#: pass a whole-job budget; a ten-second additive grace made short performance limits look
+#: like hangs before the parent intervened.
+KILL_GRACE_S = 1.0
 
 
 @dataclass

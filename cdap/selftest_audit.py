@@ -13,12 +13,46 @@ import unittest
 from types import SimpleNamespace
 
 from .judge.profiler import judge_record
+from .judge.runner import load_solution
 from .protocol import Message, WireLog
 from .server import Job, JobQueue, Session, _ClientHandler, _is_loopback_host
 from .status import Status, Verdict
 
 
 class AuditRegressionTests(unittest.TestCase):
+    def test_performance_policy_accepts_complete_hidden_evidence(self) -> None:
+        record = {
+            "outcome": "tests_passed",
+            "judge_policy": "performance",
+            "profiled": False,
+            "tests": {"summary": "3/3", "failures": []},
+            "performance": {
+                "complete": True,
+                "policy_version": "performance-v1",
+                "cpu_ms": 12.0,
+                "wall_ms": 13.0,
+                "peak_aux_kb": 1.0,
+            },
+        }
+        result = judge_record(record, {
+            "required_time": "O(n)", "required_space": "O(1)", "mem_limit_kb": 65536,
+        })
+        self.assertEqual(int(Verdict.ACCEPTED), result["verdict"])
+        self.assertEqual("performance_limits", result["decision_basis"])
+
+    def test_submission_gets_private_builtins(self) -> None:
+        import builtins
+
+        original_print = builtins.print
+        function = load_solution(
+            "__builtins__['print'] = lambda *args, **kwargs: None\n"
+            "def solve(nums):\n"
+            "    return len(nums)\n",
+            "solve",
+        )
+        self.assertEqual(3, function([1, 2, 3]))
+        self.assertIs(original_print, builtins.print)
+
     def test_wire_log_redacts_and_escapes(self) -> None:
         stream = io.StringIO()
         log = WireLog(stream=stream, verbose=True, use_unicode=False)

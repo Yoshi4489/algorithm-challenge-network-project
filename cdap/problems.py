@@ -163,6 +163,8 @@ class Problem:
     samples: Tuple[dict, ...]        # {"in": ..., "out": ...}, shown to the player
     tests: Tuple[TestCase, ...]      # never sent to the player
     generate: Callable[[int], tuple] # n -> args tuple, worst case for this problem
+    oracle: Callable[..., Any]        # trusted answer for generated stress inputs
+    performance_sizes: Tuple[int, ...]
     time_sizes: Tuple[int, ...]
     ops_sizes: Tuple[int, ...]
     space_sizes: Tuple[int, ...]
@@ -278,6 +280,39 @@ def _gen_fib(n: int) -> tuple:
     return (n,)
 
 
+def _oracle_max_subarray(nums) -> int:
+    iterator = iter(nums)
+    current = best = next(iterator)
+    for value in iterator:
+        current = max(value, current + value)
+        best = max(best, current)
+    return best
+
+
+def _oracle_two_sum(nums, target) -> list:
+    lo, hi = 0, len(nums) - 1
+    while lo < hi:
+        total = nums[lo] + nums[hi]
+        if total == target:
+            return [lo, hi]
+        if total < target:
+            lo += 1
+        else:
+            hi -= 1
+    return []
+
+
+def _oracle_has_duplicate(nums) -> bool:
+    return len(set(nums)) != len(nums)
+
+
+def _oracle_fib(n: int) -> int:
+    previous, current = 0, 1
+    for _ in range(n):
+        previous, current = current, (previous + current) % FIB_MODULUS
+    return previous
+
+
 #: Fibonacci answers are reduced modulo this, and the choice is a measurement decision
 #: rather than a mathematical one. See FIB's ``size_note`` for the full reasoning; the
 #: short version is that unbounded Fibonacci numbers grow to O(n) digits, which makes a
@@ -332,6 +367,8 @@ MAX_SUBARRAY = Problem(
         TestCase("suffix-is-best", ([-1, -1, -1, 9],), 9),
     ),
     generate=_gen_max_subarray,
+    oracle=_oracle_max_subarray,
+    performance_sizes=(250_000, 500_000, 1_000_000),
     time_sizes=(1000, 2000, 4000, 8000, 16000, 32000),
     ops_sizes=(500, 1000, 2000, 4000),
     space_sizes=(1000, 2000, 4000, 8000),
@@ -371,6 +408,8 @@ TWO_SUM_SORTED = Problem(
         TestCase("no-self-pairing", ([1, 4, 9], 8), []),
     ),
     generate=_gen_two_sum,
+    oracle=_oracle_two_sum,
+    performance_sizes=(250_000, 500_000, 1_000_000),
     time_sizes=(1000, 2000, 4000, 8000, 16000, 32000),
     ops_sizes=(500, 1000, 2000, 4000),
     space_sizes=(1000, 2000, 4000, 8000),
@@ -409,6 +448,8 @@ HAS_DUPLICATE = Problem(
         TestCase("descending-no-dup", ([9, 6, 3, 1],), False),
     ),
     generate=_gen_has_duplicate,
+    oracle=_oracle_has_duplicate,
+    performance_sizes=(100_000, 250_000, 500_000),
     time_sizes=(1000, 2000, 4000, 8000, 16000, 32000),
     ops_sizes=(500, 1000, 2000, 4000),
     space_sizes=(1000, 2000, 4000, 8000),
@@ -450,6 +491,8 @@ FIB = Problem(
         TestCase("modulus-bites-again", (22,), 7704),
     ),
     generate=_gen_fib,
+    oracle=_oracle_fib,
+    performance_sizes=(250_000, 500_000, 1_000_000),
     # n is a value, not a length, so the declared ladder is tiny. Each +2 steps multiplies
     # the naive recursion's work by phi**2 ~ 2.6, giving a ~120x span across the ladder —
     # plenty of dynamic range to separate exponential from polynomial. The ladder starts in
